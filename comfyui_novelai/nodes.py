@@ -480,22 +480,42 @@ def normalize_character_prompts(character_prompts_json: str = "", character_prom
     for cp in source:
         if cp is None:
             continue
+        ai_choice = False
+        grid = None
         if isinstance(cp, dict):
             prompt = cp.get("prompt", cp.get("char_caption", "")) or ""
             uc = cp.get("uc", cp.get("negative", "")) or ""
-            center = cp.get("center") or cp.get("centers", [{}])[0] if isinstance(cp.get("centers"), list) else cp.get("center")
-            if not center:
+            ai_choice = bool(cp.get("ai_choice", False)) or str(cp.get("position_mode", "")).lower() in {"ai_choice", "ai_choices"}
+            grid = cp.get("grid")
+            if isinstance(cp.get("centers"), list):
+                centers = cp.get("centers") or []
+                center = centers[0] if centers else None
+            else:
+                center = cp.get("center")
+            if not center and not ai_choice:
                 center = {"x": cp.get("x", 0.5), "y": cp.get("y", 0.5)}
         else:
             prompt = getattr(cp, "prompt", "") or ""
             uc = getattr(cp, "uc", "") or ""
-            center = getattr(cp, "center", None) or {"x": getattr(cp, "x", 0.5), "y": getattr(cp, "y", 0.5)}
-        try:
-            x = float(center.get("x", 0.5))
-            y = float(center.get("y", 0.5))
-        except Exception:
-            x, y = 0.5, 0.5
-        result.append({"prompt": str(prompt), "uc": str(uc), "center": {"x": x, "y": y}})
+            ai_choice = bool(getattr(cp, "ai_choice", False))
+            grid = getattr(cp, "grid", None)
+            center = getattr(cp, "center", None)
+            if not center and not ai_choice:
+                center = {"x": getattr(cp, "x", 0.5), "y": getattr(cp, "y", 0.5)}
+
+        item = {"prompt": str(prompt), "uc": str(uc)}
+        if ai_choice:
+            item["ai_choice"] = True
+        else:
+            try:
+                x = float(center.get("x", 0.5))
+                y = float(center.get("y", 0.5))
+            except Exception:
+                x, y = 0.5, 0.5
+            item["center"] = {"x": x, "y": y}
+        if grid:
+            item["grid"] = grid
+        result.append(item)
     return result
 
 
@@ -598,9 +618,13 @@ def character_preview_text(characters: List[Dict[str, Any]]) -> str:
         return "Characters: 0"
     lines = [f"Characters: {len(characters)}"]
     for idx, cp in enumerate(characters, start=1):
-        center = cp.get("center", {})
+        if cp.get("ai_choice"):
+            pos = "AI's Choice"
+        else:
+            center = cp.get("center", {})
+            pos = f"({center.get('x', 0.5):.2f},{center.get('y', 0.5):.2f})"
         lines.append(
-            f"{idx}. {cp.get('prompt', '')[:60]} | neg: {cp.get('uc', '')[:40]} | pos=({center.get('x', 0.5):.2f},{center.get('y', 0.5):.2f})"
+            f"{idx}. {cp.get('prompt', '')[:60]} | neg: {cp.get('uc', '')[:40]} | pos={pos}"
         )
     return "\n".join(lines)
 
@@ -729,16 +753,24 @@ def build_parameters(
     api_sampler = "ddim_v3" if sampler == "ddim" else sampler
     char_prompts = normalize_character_prompts(character_prompts_json, character_prompts)
 
-    char_captions = [
-        {"char_caption": cp["prompt"], "centers": [cp["center"]]}
-        for cp in char_prompts
-        if cp.get("prompt")
-    ]
-    uc_char_captions = [
-        {"char_caption": cp["uc"], "centers": [cp["center"]]}
-        for cp in char_prompts
-        if cp.get("uc")
-    ]
+    char_captions = []
+    uc_char_captions = []
+    has_explicit_character_coords = False
+    for cp in char_prompts:
+        center = cp.get("center")
+        uses_ai_choice = bool(cp.get("ai_choice")) or not isinstance(center, dict)
+        if not uses_ai_choice:
+            has_explicit_character_coords = True
+        if cp.get("prompt"):
+            item = {"char_caption": cp["prompt"]}
+            if not uses_ai_choice:
+                item["centers"] = [center]
+            char_captions.append(item)
+        if cp.get("uc"):
+            item = {"char_caption": cp["uc"]}
+            if not uses_ai_choice:
+                item["centers"] = [center]
+            uc_char_captions.append(item)
 
     params: Dict[str, Any] = {
         "params_version": 1,
@@ -775,7 +807,7 @@ def build_parameters(
         "extra_noise_seed": int(seed),
         "characterPrompts": char_prompts,
         "v4_prompt": {
-            "use_coords": True,
+            "use_coords": bool(has_explicit_character_coords),
             "use_order": True,
             "caption": {"base_caption": prompt or "", "char_captions": char_captions},
         },
@@ -1228,6 +1260,38 @@ class NovelAICharacter:
                 "grid": {"col": str(position_col), "row": str(position_row)},
             })
         return (current, character_preview_text(current))
+
+
+class NovelAICharacterPositionMode:
+    CATEGORY = "NovelAI"
+    RETURN_TYPES = ("NAI_CHARACTERS", "STRING")
+    RETURN_NAMES = ("characters", "summary")
+    FUNCTION = "build"
+    DESCRIPTION = "Intermediate character position mode node. Keep manual grid positions or switch all input characters to NovelAI-style AI's Choice."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "characters": ("NAI_CHARACTERS",),
+                "position_mode": (["keep_character_positions", "ai_choices"], {"default": "ai_choices"}),
+            },
+        }
+
+    def build(self, characters=None, position_mode="ai_choices"):
+        normalized = normalize_character_prompts("", characters)
+        mode = str(position_mode or "ai_choices")
+        if mode == "ai_choices":
+            converted = []
+            for cp in normalized:
+                converted.append({
+                    "prompt": cp.get("prompt", ""),
+                    "uc": cp.get("uc", ""),
+                    "ai_choice": True,
+                    "position_mode": "ai_choices",
+                })
+            return (converted, character_preview_text(converted))
+        return (normalized, character_preview_text(normalized))
 
 
 class NovelAIPreciseReference:
@@ -2035,6 +2099,7 @@ NODE_CLASS_MAPPINGS = {
     "NovelAIToken": NovelAIToken,
     "NovelAIParameters": NovelAIParameters,
     "NovelAICharacter": NovelAICharacter,
+    "NovelAICharacterPositionMode": NovelAICharacterPositionMode,
     "NovelAIPreciseReference": NovelAIPreciseReference,
     "NovelAIVibeTransfer": NovelAIVibeTransfer,
     "NovelAICharacterStack": NovelAICharacterStack,
@@ -2056,6 +2121,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NovelAIToken": "NovelAI Token",
     "NovelAIParameters": "NovelAI Parameters",
     "NovelAICharacter": "NovelAI Character",
+    "NovelAICharacterPositionMode": "NovelAI Character Position Mode",
     "NovelAIPreciseReference": "NovelAI 💎 Precise Reference",
     "NovelAIVibeTransfer": "NovelAI 💎 Vibe Transfer",
     "NovelAICharacterStack": "NovelAI Character Stack",
