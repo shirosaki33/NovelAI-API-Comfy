@@ -121,6 +121,13 @@ UC_PRESET_TEXT = {
     "3": "",
 }
 
+DEFAULT_RETRY_VALUES = {
+    "timeout": 180,
+    "retry_delay": 10,
+    "max_retries": 5,
+    "retry_forever": True,
+}
+
 DEFAULT_PARAM_VALUES = {
     "width": 1024,
     "height": 1024,
@@ -141,11 +148,51 @@ DEFAULT_PARAM_VALUES = {
     "batch_size": 1,
     "legacy": False,
     "check_anlas": False,
-    "timeout": 180,
-    "retry_delay": 10,
-    "max_retries": 5,
-    "retry_forever": True,
 }
+
+
+
+
+ANLAS_LAST_BALANCE: Optional[int] = None
+ANLAS_TOTAL_COST: int = 0
+
+def update_anlas_tracker(current: Optional[int], *, previous_hint: Optional[int] = None, source: str = "", note: str = "") -> Tuple[int, int, str]:
+    """Update global Anlas cost tracker. Returns (last_cost, total_cost, status_text)."""
+    global ANLAS_LAST_BALANCE, ANLAS_TOTAL_COST
+    if current is None:
+        last = 0
+        total = int(ANLAS_TOTAL_COST or 0)
+        shown = ANLAS_LAST_BALANCE if ANLAS_LAST_BALANCE is not None else "?"
+        status = f"Anlas: {shown} | Last Cost: {last} | Total Cost: {total}"
+        if note:
+            status += f" | {note}"
+        if source:
+            status += f" | Token Source: {source}"
+        return last, total, status
+
+    current_i = int(current)
+    last = 0
+    baseline = None
+    if previous_hint is not None:
+        baseline = int(previous_hint)
+    elif ANLAS_LAST_BALANCE is not None:
+        baseline = int(ANLAS_LAST_BALANCE)
+
+    if baseline is not None and current_i < baseline:
+        last = baseline - current_i
+        ANLAS_TOTAL_COST += last
+
+    ANLAS_LAST_BALANCE = current_i
+    total = int(ANLAS_TOTAL_COST or 0)
+    status = f"Anlas: {current_i} | Last Cost: {last} | Total Cost: {total}"
+    if note:
+        status += f" | {note}"
+    if source:
+        status += f" | Token Source: {source}"
+    return int(last), total, status
+
+def get_anlas_tracker_total() -> int:
+    return int(ANLAS_TOTAL_COST or 0)
 
 
 class NovelAIError(RuntimeError):
@@ -382,6 +429,38 @@ def image_tensor_to_base64_png(image: torch.Tensor, width: int, height: int) -> 
     pil.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
+def pil_to_base64_for_api(img: Image.Image) -> str:
+    """Encode like the web client: PNG for alpha images, JPEG for normal RGB images."""
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+    buf = io.BytesIO()
+    if img.mode == "RGBA":
+        img.save(buf, format="PNG")
+    else:
+        img.save(buf, format="JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def resize_and_pad_precise_reference_image(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    target_sizes = [(1024, 1536), (1472, 1472), (1536, 1024)]
+    ow, oh = img.size
+    if ow <= 0 or oh <= 0:
+        raise NovelAIError("Precise Reference image has invalid dimensions.")
+    ratio = ow / oh
+    target_w, target_h = min(target_sizes, key=lambda size: abs((size[0] / size[1]) - ratio))
+    scale = min(target_w / ow, target_h / oh)
+    nw = max(1, int(round(ow * scale)))
+    nh = max(1, int(round(oh * scale)))
+    resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    padded = Image.new("RGB", (target_w, target_h), color=(0, 0, 0))
+    padded.paste(resized, ((target_w - nw) // 2, (target_h - nh) // 2))
+    return padded
+
+
+def precise_reference_tensor_to_base64(image: torch.Tensor) -> str:
+    return pil_to_base64_for_api(resize_and_pad_precise_reference_image(tensor_to_pil(image)))
+
 
 def mask_tensor_to_base64_png(mask: torch.Tensor, width: int, height: int, invert: bool = False) -> str:
     pil = tensor_to_pil(mask).convert("L")
@@ -606,10 +685,6 @@ def parameter_node_inputs() -> Dict[str, Any]:
         "batch_size": ("INT", {"default": DEFAULT_PARAM_VALUES["batch_size"], "min": 1, "max": 8}),
         "legacy": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["legacy"]}),
         "check_anlas": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["check_anlas"]}),
-        "timeout": ("INT", {"default": DEFAULT_PARAM_VALUES["timeout"], "min": 10, "max": 600}),
-        "retry_delay": ("INT", {"default": DEFAULT_PARAM_VALUES["retry_delay"], "min": 1, "max": 300}),
-        "max_retries": ("INT", {"default": DEFAULT_PARAM_VALUES["max_retries"], "min": 0, "max": 999}),
-        "retry_forever": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["retry_forever"]}),
     }
 
 
@@ -673,16 +748,54 @@ def reference_preview_text(references: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def apply_references_to_params(params: Dict[str, Any], references: Any = None) -> int:
+def _model_is_v45(model: Any) -> bool:
+    return str(model or "").startswith("nai-diffusion-4-5")
+
+
+def apply_references_to_params(params: Dict[str, Any], references: Any = None, model: str = "") -> int:
     refs = normalize_references(references)
+
+    # Always clear both legacy Vibe fields and V4.5 precise-reference fields first.
+    params["reference_image_multiple"] = []
+    params["reference_information_extracted_multiple"] = []
+    params["reference_strength_multiple"] = []
+    params.pop("director_reference_images", None)
+    params.pop("director_reference_descriptions", None)
+    params.pop("director_reference_strength_values", None)
+    params.pop("director_reference_secondary_strength_values", None)
+    params.pop("director_reference_information_extracted", None)
+
     if not refs:
-        params["reference_image_multiple"] = []
-        params["reference_information_extracted_multiple"] = []
-        params["reference_strength_multiple"] = []
         return 0
-    params["reference_image_multiple"] = [r["image"] for r in refs]
-    params["reference_information_extracted_multiple"] = [float(r["information_extracted"]) for r in refs]
-    params["reference_strength_multiple"] = [float(r["strength"]) for r in refs]
+
+    modes = {str(r.get("mode", "precise_reference") or "precise_reference") for r in refs}
+    unsupported = modes - {"precise_reference"}
+    if unsupported:
+        raise NovelAIError(
+            "Unsupported reference mode removed from this node pack: "
+            + ", ".join(sorted(unsupported))
+            + ". Use NovelAI Precise Reference with V4.5 models only."
+        )
+
+    if not _model_is_v45(model):
+        raise NovelAIError(
+            "Precise Reference is V4.5-only in this node pack. "
+            "Use nai-diffusion-4-5-full / nai-diffusion-4-5-curated, or disconnect Precise Reference."
+        )
+
+    params["director_reference_images"] = [r["image"] for r in refs]
+    # API expects V4ConditionInput objects here, not plain strings.
+    # base_caption selects what kind of precise reference is applied.
+    params["director_reference_descriptions"] = [
+        {
+            "caption": {"base_caption": "character&style", "char_captions": []},
+            "legacy_uc": False,
+        }
+        for _ in refs
+    ]
+    params["director_reference_strength_values"] = [float(r["strength"]) for r in refs]
+    params["director_reference_secondary_strength_values"] = [1.0 - float(r["information_extracted"]) for r in refs]
+    params["director_reference_information_extracted"] = [1.0 for _ in refs]
     return len(refs)
 
 
@@ -723,14 +836,17 @@ def perform_novelai_request(
         print(f"[NovelAI] Anlas after: {after if after is not None else msg}")
 
     actual_cost = 0
+    tracker_status = ""
     if before is not None and after is not None:
         actual_cost = max(0, int(before) - int(after))
+        tracked_last, _, tracker_status = update_anlas_tracker(after, previous_hint=before, source=source, note="after generation")
+        actual_cost = tracked_last if tracked_last > 0 else actual_cost
+    else:
+        _, _, tracker_status = update_anlas_tracker(after if after is not None else before, source=source, note="after generation")
     estimated_next_cost = actual_cost if actual_cost > 0 else int(estimated_cost)
     anlas_text = (
-        f"Anlas: {after if after is not None else (before if before is not None else '?')}"
+        f"{tracker_status}"
         f" | Estimated Cost: {estimated_next_cost}"
-        f" | Last Actual Cost: {actual_cost}"
-        f" | Token Source: {source}"
     )
     return image_tensor, anlas_text, int(before or 0), int(after or 0), int(actual_cost), source
 
@@ -917,10 +1033,6 @@ def generate_novelai(
     batch_size = int(resolved["batch_size"])
     legacy = bool(resolved["legacy"])
     check_anlas = bool(resolved["check_anlas"])
-    timeout = int(resolved["timeout"])
-    retry_delay = int(resolved["retry_delay"])
-    max_retries = int(resolved["max_retries"])
-    retry_forever = bool(resolved["retry_forever"])
     if img2img_image is not None and not isinstance(parameters, dict):
         try:
             if img2img_image.ndim == 4:
@@ -980,7 +1092,7 @@ def generate_novelai(
         character_prompts_json=effective_character_prompts_json,
         character_prompts=effective_character_prompts,
     )
-    reference_count = apply_references_to_params(params, references)
+    reference_count = apply_references_to_params(params, references, model=model)
 
     action = "generate"
     if img2img_image is not None:
@@ -1019,14 +1131,17 @@ def generate_novelai(
         print(f"[NovelAI] Anlas after: {after if after is not None else msg}")
 
     actual_cost = 0
+    tracker_status = ""
     if before is not None and after is not None:
         actual_cost = max(0, int(before) - int(after))
+        tracked_last, _, tracker_status = update_anlas_tracker(after, previous_hint=before, source=source, note="after generation")
+        actual_cost = tracked_last if tracked_last > 0 else actual_cost
+    else:
+        _, _, tracker_status = update_anlas_tracker(after if after is not None else before, source=source, note="after generation")
     estimated_next_cost = actual_cost if actual_cost > 0 else estimated_cost
     anlas_text = (
-        f"Anlas: {after if after is not None else (before if before is not None else '?')}"
+        f"{tracker_status}"
         f" | Estimated Cost: {estimated_next_cost}"
-        f" | Last Actual Cost: {actual_cost}"
-        f" | Token Source: {source}"
     )
 
     info = {
@@ -1193,6 +1308,35 @@ class NovelAIParameters:
         return (config,)
 
 
+def merge_retry_values(retry_settings: Any = None) -> Dict[str, Any]:
+    merged = dict(DEFAULT_RETRY_VALUES)
+    if isinstance(retry_settings, dict):
+        merged.update({k: v for k, v in retry_settings.items() if k in merged})
+    return merged
+
+
+class NovelAIRetrySettings:
+    CATEGORY = "NovelAI"
+    RETURN_TYPES = ("NAI_RETRY_SETTINGS",)
+    RETURN_NAMES = ("retry_settings",)
+    FUNCTION = "build"
+    DESCRIPTION = "Builds reusable timeout and retry settings for NovelAI T2I/I2I nodes."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "timeout": ("INT", {"default": DEFAULT_RETRY_VALUES["timeout"], "min": 10, "max": 600}),
+                "retry_delay": ("INT", {"default": DEFAULT_RETRY_VALUES["retry_delay"], "min": 1, "max": 300}),
+                "max_retries": ("INT", {"default": DEFAULT_RETRY_VALUES["max_retries"], "min": 0, "max": 999}),
+                "retry_forever": ("BOOLEAN", {"default": DEFAULT_RETRY_VALUES["retry_forever"]}),
+            }
+        }
+
+    def build(self, **kwargs):
+        return (merge_retry_values(kwargs),)
+
+
 class NovelAICharactersLegacy:
     CATEGORY = "NovelAI"
     RETURN_TYPES = ("NAI_CHARACTERS",)
@@ -1294,48 +1438,7 @@ class NovelAIPreciseReference:
                 h, w = int(image.shape[0]), int(image.shape[1])
             current.append({
                 "mode": "precise_reference",
-                "image": image_tensor_to_base64_png(image, w, h),
-                "information_extracted": float(information_extracted),
-                "strength": float(strength),
-            })
-        return (current,)
-
-
-class NovelAIVibeTransfer:
-    CATEGORY = "NovelAI"
-    RETURN_TYPES = ("NAI_REFERENCES",)
-    RETURN_NAMES = ("references",)
-    FUNCTION = "build"
-    DESCRIPTION = "💎 Vibe Transfer builder. Adds a reference image for NovelAI generation. This feature can spend Anlas."
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "enabled": ("BOOLEAN", {"default": True}),
-                "information_extracted": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "strength": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01}),
-            },
-            "optional": {
-                "references": ("NAI_REFERENCES",),
-            },
-        }
-
-    def build(self, image, enabled=True, information_extracted=0.40, strength=0.80, references=None):
-        current: List[Dict[str, Any]] = []
-        if isinstance(references, list):
-            current = [dict(x) for x in references if isinstance(x, dict)]
-        elif isinstance(references, dict):
-            current = [dict(references)]
-        if enabled:
-            if image.ndim == 4:
-                h, w = int(image.shape[1]), int(image.shape[2])
-            else:
-                h, w = int(image.shape[0]), int(image.shape[1])
-            current.append({
-                "mode": "vibe_transfer",
-                "image": image_tensor_to_base64_png(image, w, h),
+                "image": precise_reference_tensor_to_base64(image),
                 "information_extracted": float(information_extracted),
                 "strength": float(strength),
             })
@@ -1347,12 +1450,12 @@ class NovelAICharacterStack:
     RETURN_TYPES = ("NAI_CHARACTERS",)
     RETURN_NAMES = ("characters",)
     FUNCTION = "build"
-    DESCRIPTION = "Combines up to 20 character inputs. Position Mode: position random = NovelAI-like AI Choices; position manual = keep Character grid positions."
+    DESCRIPTION = "Combines up to 8 character inputs. Position Mode: position random = NovelAI-like AI Choices; position manual = keep Character grid positions."
 
     @classmethod
     def INPUT_TYPES(cls):
         optional = {}
-        for i in range(1, 21):
+        for i in range(1, 9):
             optional[f"character_{i}"] = ("NAI_CHARACTERS",)
         return {
             "required": {
@@ -1363,7 +1466,7 @@ class NovelAICharacterStack:
 
     def build(self, position_mode="position random", **kwargs):
         combined = []
-        for i in range(1, 21):
+        for i in range(1, 9):
             key = f"character_{i}"
             value = kwargs.get(key)
             if isinstance(value, list):
@@ -1401,10 +1504,10 @@ class NovelAICharacterStack:
 
 class NovelAIT2ICompact:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT", "INT", "INT")
-    RETURN_NAMES = ("image", "info_json", "anlas_text", "anlas_before", "anlas_after", "actual_cost")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "anlas", "last_actual_cost", "actual_cost_total", "status_text")
     FUNCTION = "generate"
-    DESCRIPTION = "Compact NovelAI text-to-image node that receives parameters and characters from separate builder nodes."
+    DESCRIPTION = "Compact NovelAI text-to-image node that receives parameters, retry settings, characters and references from separate builder nodes."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1415,15 +1518,17 @@ class NovelAIT2ICompact:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, prompt, negative_prompt, parameters=None, characters=None, references=None, api_token=""):
+    def generate(self, prompt, negative_prompt, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        return generate_novelai(
+        retry = merge_retry_values(retry_settings)
+        result = generate_novelai(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=base["width"],
@@ -1445,23 +1550,24 @@ class NovelAIT2ICompact:
             batch_size=base["batch_size"],
             legacy=base["legacy"],
             api_token=api_token,
-            timeout=base["timeout"],
-            retry_delay=base["retry_delay"],
-            max_retries=base["max_retries"],
-            retry_forever=base["retry_forever"],
-            check_anlas=base["check_anlas"],
+            timeout=retry["timeout"],
+            retry_delay=retry["retry_delay"],
+            max_retries=retry["max_retries"],
+            retry_forever=retry["retry_forever"],
+            check_anlas=True,
             parameters=parameters,
             characters=characters,
             references=references,
         )
+        return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
 
 
 class NovelAII2ICompact:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT", "INT", "INT")
-    RETURN_NAMES = ("image", "info_json", "anlas_text", "anlas_before", "anlas_after", "actual_cost")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "anlas", "last_actual_cost", "actual_cost_total", "status_text")
     FUNCTION = "generate"
-    DESCRIPTION = "Compact NovelAI image-to-image node that receives parameters and characters from separate builder nodes."
+    DESCRIPTION = "Compact NovelAI image-to-image node that receives parameters, retry settings, characters and references from separate builder nodes."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1475,15 +1581,17 @@ class NovelAII2ICompact:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt, negative_prompt, strength, noise, parameters=None, characters=None, references=None, api_token=""):
+    def generate(self, image, prompt, negative_prompt, strength, noise, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        return generate_novelai(
+        retry = merge_retry_values(retry_settings)
+        result = generate_novelai(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=base["width"],
@@ -1505,10 +1613,10 @@ class NovelAII2ICompact:
             batch_size=base["batch_size"],
             legacy=base["legacy"],
             api_token=api_token,
-            timeout=base["timeout"],
-            retry_delay=base["retry_delay"],
-            max_retries=base["max_retries"],
-            retry_forever=base["retry_forever"],
+            timeout=retry["timeout"],
+            retry_delay=retry["retry_delay"],
+            max_retries=retry["max_retries"],
+            retry_forever=retry["retry_forever"],
             check_anlas=base["check_anlas"],
             img2img_image=image,
             strength=strength,
@@ -1517,6 +1625,7 @@ class NovelAII2ICompact:
             characters=characters,
             references=references,
         )
+        return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
 
 
 class NovelAIInpaint:
@@ -1540,14 +1649,16 @@ class NovelAIInpaint:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, mask, prompt, negative_prompt, invert_mask=False, strength=0.50, noise=0.10, parameters=None, characters=None, references=None, api_token=""):
+    def generate(self, image, mask, prompt, negative_prompt, invert_mask=False, strength=0.50, noise=0.10, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
+        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -1581,7 +1692,7 @@ class NovelAIInpaint:
             character_prompts_json="",
             character_prompts=characters,
         )
-        reference_count = apply_references_to_params(params, references)
+        reference_count = apply_references_to_params(params, references, model=str(base["model"]))
         params["image"] = image_tensor_to_base64_png(image, width, height)
         params["mask"] = mask_tensor_to_base64_png(mask, width, height, bool(invert_mask))
         params["strength"] = float(strength)
@@ -1595,11 +1706,11 @@ class NovelAIInpaint:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(base["timeout"]),
-            retry_delay=int(base["retry_delay"]),
-            max_retries=int(base["max_retries"]),
-            retry_forever=bool(base["retry_forever"]),
-            check_anlas=bool(base["check_anlas"]),
+            timeout=int(retry["timeout"]),
+            retry_delay=int(retry["retry_delay"]),
+            max_retries=int(retry["max_retries"]),
+            retry_forever=bool(retry["retry_forever"]),
+            check_anlas=True,
             estimated_cost=estimate_anlas_cost(width=width, height=height, steps=int(base["steps"]), batch_size=1, img2img=True, quality_toggle=bool(base["quality_toggle"])) + 1,
         )
         info = {
@@ -1646,14 +1757,16 @@ class NovelAIEnhance:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt, negative_prompt, strength=0.50, noise=0.10, parameters=None, characters=None, references=None, api_token=""):
+    def generate(self, image, prompt, negative_prompt, strength=0.50, noise=0.10, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
+        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -1687,7 +1800,7 @@ class NovelAIEnhance:
             character_prompts_json="",
             character_prompts=characters,
         )
-        reference_count = apply_references_to_params(params, references)
+        reference_count = apply_references_to_params(params, references, model=str(base["model"]))
         params["image"] = image_tensor_to_base64_png(image, width, height)
         params["strength"] = float(strength)
         params["noise"] = float(noise)
@@ -1700,11 +1813,11 @@ class NovelAIEnhance:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(base["timeout"]),
-            retry_delay=int(base["retry_delay"]),
-            max_retries=int(base["max_retries"]),
-            retry_forever=bool(base["retry_forever"]),
-            check_anlas=bool(base["check_anlas"]),
+            timeout=int(retry["timeout"]),
+            retry_delay=int(retry["retry_delay"]),
+            max_retries=int(retry["max_retries"]),
+            retry_forever=bool(retry["retry_forever"]),
+            check_anlas=True,
             estimated_cost=estimate_anlas_cost(width=width, height=height, steps=int(base["steps"]), batch_size=1, img2img=True, quality_toggle=bool(base["quality_toggle"])) + 1,
         )
         info = {
@@ -1748,12 +1861,14 @@ class NovelAIUpscale:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, scale_factor="2", parameters=None, api_token=""):
+    def generate(self, image, scale_factor="2", parameters=None, retry_settings=None, api_token=""):
         base = merge_parameter_values(parameters)
+        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -1782,11 +1897,11 @@ class NovelAIUpscale:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(base["timeout"]),
-            retry_delay=int(base["retry_delay"]),
-            max_retries=int(base["max_retries"]),
-            retry_forever=bool(base["retry_forever"]),
-            check_anlas=bool(base["check_anlas"]),
+            timeout=int(retry["timeout"]),
+            retry_delay=int(retry["retry_delay"]),
+            max_retries=int(retry["max_retries"]),
+            retry_forever=bool(retry["retry_forever"]),
+            check_anlas=True,
             estimated_cost=max(1, factor * factor),
         )
         info = {
@@ -1811,6 +1926,7 @@ def run_director_tool(
     action: str,
     image,
     parameters: Any = None,
+    retry_settings: Any = None,
     api_token: str = "",
     prompt: str = "",
     negative_prompt: str = "",
@@ -1820,6 +1936,7 @@ def run_director_tool(
     estimated_cost: int = 1,
 ) -> Tuple[torch.Tensor, str, str, int, int, int]:
     base = merge_parameter_values(parameters)
+    retry = merge_retry_values(retry_settings)
     width = int(base["width"])
     height = int(base["height"])
     if image is not None:
@@ -1854,7 +1971,7 @@ def run_director_tool(
         character_prompts_json="",
         character_prompts=characters,
     )
-    reference_count = apply_references_to_params(params, references)
+    reference_count = apply_references_to_params(params, references, model=str(base["model"]))
     params["image"] = image_tensor_to_base64_png(image, width, height)
     if extra_params:
         params.update(extra_params)
@@ -1868,11 +1985,11 @@ def run_director_tool(
     image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
         payload=payload,
         api_token=api_token,
-        timeout=int(base["timeout"]),
-        retry_delay=int(base["retry_delay"]),
-        max_retries=int(base["max_retries"]),
-        retry_forever=bool(base["retry_forever"]),
-        check_anlas=bool(base["check_anlas"]),
+        timeout=int(retry["timeout"]),
+        retry_delay=int(retry["retry_delay"]),
+        max_retries=int(retry["max_retries"]),
+        retry_forever=bool(retry["retry_forever"]),
+        check_anlas=True,
         estimated_cost=int(estimated_cost),
     )
     info = {
@@ -1916,15 +2033,17 @@ class NovelAIRemoveBackground:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, result_mode="generated", parameters=None, api_token=""):
+    def generate(self, image, result_mode="generated", parameters=None, retry_settings=None, api_token=""):
         return run_director_tool(
             action="remove_background",
             image=image,
             parameters=parameters,
+            retry_settings=retry_settings,
             api_token=api_token,
             extra_params={"result_mode": str(result_mode)},
             estimated_cost=1,
@@ -1942,11 +2061,11 @@ class NovelAILineArt:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, api_token=""):
-        return run_director_tool(action="lineart", image=image, parameters=parameters, api_token=api_token, estimated_cost=1)
+    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
+        return run_director_tool(action="lineart", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
 
 
 class NovelAISketch:
@@ -1960,11 +2079,11 @@ class NovelAISketch:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, api_token=""):
-        return run_director_tool(action="sketch", image=image, parameters=parameters, api_token=api_token, estimated_cost=1)
+    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
+        return run_director_tool(action="sketch", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
 
 
 class NovelAIColorize:
@@ -1984,15 +2103,17 @@ class NovelAIColorize:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt="", defry=0.0, parameters=None, api_token=""):
+    def generate(self, image, prompt="", defry=0.0, parameters=None, retry_settings=None, api_token=""):
         return run_director_tool(
             action="colorize",
             image=image,
             parameters=parameters,
+            retry_settings=retry_settings,
             api_token=api_token,
             prompt=prompt,
             extra_params={"defry": float(defry)},
@@ -2023,15 +2144,17 @@ class NovelAIEmotion:
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
+                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, emotion="neutral", emotion_level=0.5, prompt="", parameters=None, api_token=""):
+    def generate(self, image, emotion="neutral", emotion_level=0.5, prompt="", parameters=None, retry_settings=None, api_token=""):
         return run_director_tool(
             action="emotion",
             image=image,
             parameters=parameters,
+            retry_settings=retry_settings,
             api_token=api_token,
             prompt=prompt,
             extra_params={"emotion": str(emotion), "emotion_level": float(emotion_level)},
@@ -2050,19 +2173,19 @@ class NovelAIDeclutter:
     def INPUT_TYPES(cls):
         return {
             "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, api_token=""):
-        return run_director_tool(action="declutter", image=image, parameters=parameters, api_token=api_token, estimated_cost=1)
+    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
+        return run_director_tool(action="declutter", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
 
 
 class NovelAIAnlas:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("STRING", "INT")
-    RETURN_NAMES = ("anlas_text", "anlas")
+    RETURN_TYPES = ("INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("anlas", "last_actual_cost", "actual_cost_total", "status_text")
     FUNCTION = "check"
-    DESCRIPTION = "Checks NovelAI Anlas balance."
+    DESCRIPTION = "Checks NovelAI Anlas balance. Remembers the previous balance internally and tracks generation cost automatically."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2078,24 +2201,31 @@ class NovelAIAnlas:
 
     def check(self, trigger=True, timeout=30, api_token=""):
         if not trigger:
-            return ("Anlas check disabled", 0)
+            current = int(ANLAS_LAST_BALANCE or 0)
+            total = int(ANLAS_TOTAL_COST or 0)
+            status = f"Anlas: {current if current > 0 else '?'} | Last Cost: 0 | Total Cost: {total} | check disabled"
+            return (current, 0, total, status)
+
         token, source = get_token(api_token)
         value, msg = get_anlas_balance(token, timeout=int(timeout))
         if value is None:
-            text = f"Anlas unavailable ({msg})"
-            print(f"[NovelAI] {text}")
-            return (text, 0)
-        text = f"Anlas: {value} (token source: {source})"
-        print(f"[NovelAI] {text}")
-        return (text, int(value))
+            current = int(ANLAS_LAST_BALANCE or 0)
+            total = int(ANLAS_TOTAL_COST or 0)
+            status = f"Anlas unavailable ({msg}) | Last Cost: 0 | Total Cost: {total}"
+            print(f"[NovelAI] {status}")
+            return (current, 0, total, status)
+
+        last_cost, total, status = update_anlas_tracker(int(value), source=source, note="manual check")
+        print(f"[NovelAI] {status}")
+        return (int(value), int(last_cost), int(total), status)
 
 
 NODE_CLASS_MAPPINGS = {
     "NovelAIToken": NovelAIToken,
     "NovelAIParameters": NovelAIParameters,
+    "NovelAIRetrySettings": NovelAIRetrySettings,
     "NovelAICharacter": NovelAICharacter,
     "NovelAIPreciseReference": NovelAIPreciseReference,
-    "NovelAIVibeTransfer": NovelAIVibeTransfer,
     "NovelAICharacterStack": NovelAICharacterStack,
     "NovelAIT2I": NovelAIT2ICompact,
     "NovelAII2I": NovelAII2ICompact,
@@ -2114,20 +2244,20 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NovelAIToken": "NovelAI Token",
     "NovelAIParameters": "NovelAI Parameters",
-    "NovelAICharacter": "NovelAI Character",
-    "NovelAIPreciseReference": "NovelAI 💎 Precise Reference",
-    "NovelAIVibeTransfer": "NovelAI 💎 Vibe Transfer",
-    "NovelAICharacterStack": "NovelAI Character Stack",
+    "NovelAIRetrySettings": "NovelAI Retry Settings",
+    "NovelAICharacter": "NovelAI Character (V4.5)",
+    "NovelAIPreciseReference": "NovelAI 💎 Precise Reference (V4.5)",
+    "NovelAICharacterStack": "NovelAI Character Stack (V4.5)",
     "NovelAIT2I": "NovelAI T2I",
     "NovelAII2I": "NovelAI I2I",
     "NovelAIInpaint": "NovelAI 💎 Inpaint",
     "NovelAIEnhance": "NovelAI 💎 Enhance",
     "NovelAIUpscale": "NovelAI 💎 Upscale",
-    "NovelAIRemoveBackground": "NovelAI 💎 Remove Background",
-    "NovelAILineArt": "NovelAI 💎 Line Art",
-    "NovelAISketch": "NovelAI 💎 Sketch",
-    "NovelAIColorize": "NovelAI 💎 Colorize",
-    "NovelAIEmotion": "NovelAI 💎 Emotion",
-    "NovelAIDeclutter": "NovelAI 💎 Declutter",
+    "NovelAIRemoveBackground": "NovelAI 💎 Remove Background (Director Tool)",
+    "NovelAILineArt": "NovelAI 💎 Line Art (Director Tool)",
+    "NovelAISketch": "NovelAI 💎 Sketch (Director Tool)",
+    "NovelAIColorize": "NovelAI 💎 Colorize (Director Tool)",
+    "NovelAIEmotion": "NovelAI 💎 Emotion (Director Tool)",
+    "NovelAIDeclutter": "NovelAI 💎 Declutter (Director Tool)",
     "NovelAIAnlas": "NovelAI Anlas",
 }
