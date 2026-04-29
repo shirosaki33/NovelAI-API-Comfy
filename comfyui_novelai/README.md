@@ -36,11 +36,11 @@ It outputs a `STRING` token connector so you only type the token once and connec
 - `NovelAI T2I`
 - `NovelAI I2I`
 - `NovelAI Anlas`
+- `NovelAI Retry Settings`
 
 ## Reference and editing nodes
 
 - `NovelAI 💎 Precise Reference`
-- `NovelAI 💎 Vibe Transfer`
 - `NovelAI 💎 Inpaint`
 - `NovelAI 💎 Enhance`
 - `NovelAI 💎 Upscale`
@@ -58,11 +58,13 @@ Nodes marked with `💎` may spend Anlas.
 
 ## Character system
 
-Use `NovelAI Character` for one character block and combine multiple blocks with `NovelAI Character Stack` (up to 20 inputs).
+Use `NovelAI Character (V4.5)` for one character block and combine multiple blocks with `NovelAI Character Stack (V4.5)` (up to 8 inputs).
 
 ## Notes
 
-- Includes retry handling for transient API/network errors.
-- Includes Anlas reporting (`anlas_text`, `anlas_before`, `anlas_after`, `actual_cost`).
+- Includes retry handling through the separate `NovelAI Retry Settings` node.
+- T2I/I2I output Anlas balance, last generation cost, total tracked cost, and status text after generation.
+- `NovelAI Anlas` also works as a manual tracker/check node using the same internal cost counter.
 - Includes the extra samplers `k_dpm_2` and `k_dpm_fast`.
+- Precise Reference is V4.5-only and reference images are resized/padded before being sent to the API.
 - Director tool nodes are included on a best-effort basis and may need payload fine-tuning depending on API-side changes.
