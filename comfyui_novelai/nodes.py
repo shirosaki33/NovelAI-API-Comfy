@@ -112,6 +112,23 @@ CHARACTER_GRID_ROW_MAP = {
     "5": 0.90,
 }
 
+PRECISE_REFERENCE_TYPE_CHOICES = [
+    "Character & Style",
+    "Character",
+    "Style",
+]
+
+PRECISE_REFERENCE_TYPE_MAP = {
+    "Character & Style": "character&style",
+    "Character": "character",
+    "Style": "style",
+    "character&style": "character&style",
+    "character": "character",
+    "style": "style",
+}
+
+DEFAULT_PRECISE_REFERENCE_TYPE = "Character & Style"
+
 UC_PRESET_CHOICES = ["0", "1", "2", "3"]
 
 UC_PRESET_TEXT = {
@@ -462,6 +479,25 @@ def precise_reference_tensor_to_base64(image: torch.Tensor) -> str:
     return pil_to_base64_for_api(resize_and_pad_precise_reference_image(tensor_to_pil(image)))
 
 
+def legacy_reference_tensor_to_base64(image: torch.Tensor) -> str:
+    """Encode a Vibe Transfer / legacy reference without Precise Reference padding."""
+    return pil_to_base64_for_api(tensor_to_pil(image))
+
+
+def normalize_precise_reference_type(value: Any = None) -> str:
+    raw = str(value or DEFAULT_PRECISE_REFERENCE_TYPE).strip()
+    if raw in PRECISE_REFERENCE_TYPE_MAP:
+        return PRECISE_REFERENCE_TYPE_MAP[raw]
+    normalized = raw.lower().replace("_", " ").replace("-", " ").strip()
+    if normalized in {"character style", "character and style", "character & style", "character&style"}:
+        return "character&style"
+    if normalized in {"character", "char"}:
+        return "character"
+    if normalized in {"style"}:
+        return "style"
+    return PRECISE_REFERENCE_TYPE_MAP[DEFAULT_PRECISE_REFERENCE_TYPE]
+
+
 def mask_tensor_to_base64_png(mask: torch.Tensor, width: int, height: int, invert: bool = False) -> str:
     pil = tensor_to_pil(mask).convert("L")
     if pil.size != (int(width), int(height)):
@@ -733,6 +769,31 @@ def normalize_references(references: Any = None) -> List[Dict[str, Any]]:
             "information_extracted": float(ref.get("information_extracted", 0.5)),
             "strength": float(ref.get("strength", 0.6)),
             "mode": str(ref.get("mode", "precise_reference") or "precise_reference"),
+            "reference_type": normalize_precise_reference_type(
+                ref.get("reference_type", ref.get("base_caption", ref.get("precise_reference_type", DEFAULT_PRECISE_REFERENCE_TYPE)))
+            ),
+        })
+    return result
+
+
+def normalize_reference_legacy(reference_legacy: Any = None) -> List[Dict[str, Any]]:
+    if not reference_legacy:
+        return []
+    source = reference_legacy
+    if isinstance(source, dict):
+        source = [source]
+    result: List[Dict[str, Any]] = []
+    for ref in source:
+        if not isinstance(ref, dict):
+            continue
+        image_b64 = str(ref.get("image") or ref.get("image_b64") or "").strip()
+        if not image_b64:
+            continue
+        result.append({
+            "image": image_b64,
+            "information_extracted": float(ref.get("information_extracted", 0.5)),
+            "strength": float(ref.get("strength", 0.6)),
+            "mode": str(ref.get("mode", "vibe_transfer") or "vibe_transfer"),
         })
     return result
 
@@ -743,7 +804,18 @@ def reference_preview_text(references: List[Dict[str, Any]]) -> str:
     lines = [f"References: {len(references)}"]
     for idx, ref in enumerate(references, start=1):
         lines.append(
-            f"{idx}. mode={ref.get('mode', 'precise_reference')} | info={float(ref.get('information_extracted', 0.5)):.2f} | strength={float(ref.get('strength', 0.6)):.2f}"
+            f"{idx}. mode={ref.get('mode', 'precise_reference')} | type={ref.get('reference_type', 'character&style')} | info={float(ref.get('information_extracted', 0.5)):.2f} | strength={float(ref.get('strength', 0.6)):.2f}"
+        )
+    return "\n".join(lines)
+
+
+def reference_legacy_preview_text(references: List[Dict[str, Any]]) -> str:
+    if not references:
+        return "Legacy references: 0"
+    lines = [f"Legacy references: {len(references)}"]
+    for idx, ref in enumerate(references, start=1):
+        lines.append(
+            f"{idx}. mode={ref.get('mode', 'vibe_transfer')} | info={float(ref.get('information_extracted', 0.5)):.2f} | strength={float(ref.get('strength', 0.6)):.2f}"
         )
     return "\n".join(lines)
 
@@ -772,9 +844,9 @@ def apply_references_to_params(params: Dict[str, Any], references: Any = None, m
     unsupported = modes - {"precise_reference"}
     if unsupported:
         raise NovelAIError(
-            "Unsupported reference mode removed from this node pack: "
+            "Unsupported reference mode for the Precise Reference input: "
             + ", ".join(sorted(unsupported))
-            + ". Use NovelAI Precise Reference with V4.5 models only."
+            + ". Use NovelAI Precise Reference with the references input, or use Vibe Transfer (legacy) with reference_legacy."
         )
 
     if not _model_is_v45(model):
@@ -788,14 +860,38 @@ def apply_references_to_params(params: Dict[str, Any], references: Any = None, m
     # base_caption selects what kind of precise reference is applied.
     params["director_reference_descriptions"] = [
         {
-            "caption": {"base_caption": "character&style", "char_captions": []},
+            "caption": {"base_caption": normalize_precise_reference_type(r.get("reference_type")), "char_captions": []},
             "legacy_uc": False,
         }
-        for _ in refs
+        for r in refs
     ]
     params["director_reference_strength_values"] = [float(r["strength"]) for r in refs]
     params["director_reference_secondary_strength_values"] = [1.0 - float(r["information_extracted"]) for r in refs]
     params["director_reference_information_extracted"] = [1.0 for _ in refs]
+    return len(refs)
+
+
+def apply_reference_legacy_to_params(params: Dict[str, Any], reference_legacy: Any = None) -> int:
+    refs = normalize_reference_legacy(reference_legacy)
+    if not refs:
+        return 0
+
+    if params.get("director_reference_images"):
+        raise NovelAIError(
+            "Precise Reference and Vibe Transfer (legacy) cannot be used together. "
+            "Disconnect either references or reference_legacy."
+        )
+
+    # Vibe Transfer uses the legacy reference_* fields and must not include V4.5 director-reference fields.
+    params.pop("director_reference_images", None)
+    params.pop("director_reference_descriptions", None)
+    params.pop("director_reference_strength_values", None)
+    params.pop("director_reference_secondary_strength_values", None)
+    params.pop("director_reference_information_extracted", None)
+
+    params["reference_image_multiple"] = [r["image"] for r in refs]
+    params["reference_information_extracted_multiple"] = [float(r["information_extracted"]) for r in refs]
+    params["reference_strength_multiple"] = [float(r["strength"]) for r in refs]
     return len(refs)
 
 
@@ -1008,6 +1104,7 @@ def generate_novelai(
     parameters: Any = None,
     characters: Any = None,
     references: Any = None,
+    reference_legacy: Any = None,
     **extra: Any,
 ) -> Tuple[torch.Tensor, str, str, int, int, int]:
     token, source = get_token(api_token)
@@ -1093,6 +1190,7 @@ def generate_novelai(
         character_prompts=effective_character_prompts,
     )
     reference_count = apply_references_to_params(params, references, model=model)
+    reference_legacy_count = apply_reference_legacy_to_params(params, reference_legacy)
 
     action = "generate"
     if img2img_image is not None:
@@ -1159,6 +1257,7 @@ def generate_novelai(
         "batch_size": int(batch_size),
         "character_count": len(normalize_character_prompts("", effective_character_prompts)) if effective_character_prompts is not None else len(normalize_character_prompts(effective_character_prompts_json, None)),
         "reference_count": int(reference_count),
+        "reference_legacy_count": int(reference_legacy_count),
         "strength": float(strength) if img2img_image is not None else None,
         "noise": float(noise) if img2img_image is not None else None,
         "anlas_before": before,
@@ -1417,6 +1516,7 @@ class NovelAIPreciseReference:
             "required": {
                 "image": ("IMAGE",),
                 "enabled": ("BOOLEAN", {"default": True}),
+                "reference_type": (PRECISE_REFERENCE_TYPE_CHOICES, {"default": DEFAULT_PRECISE_REFERENCE_TYPE}),
                 "information_extracted": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "strength": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
@@ -1425,7 +1525,7 @@ class NovelAIPreciseReference:
             },
         }
 
-    def build(self, image, enabled=True, information_extracted=0.50, strength=0.60, references=None):
+    def build(self, image, enabled=True, reference_type=DEFAULT_PRECISE_REFERENCE_TYPE, information_extracted=0.50, strength=0.60, references=None):
         current: List[Dict[str, Any]] = []
         if isinstance(references, list):
             current = [dict(x) for x in references if isinstance(x, dict)]
@@ -1439,6 +1539,44 @@ class NovelAIPreciseReference:
             current.append({
                 "mode": "precise_reference",
                 "image": precise_reference_tensor_to_base64(image),
+                "reference_type": normalize_precise_reference_type(reference_type),
+                "information_extracted": float(information_extracted),
+                "strength": float(strength),
+            })
+        return (current,)
+
+
+class NovelAIVibeTransferLegacy:
+    CATEGORY = "NovelAI"
+    RETURN_TYPES = ("NAI_REFERENCE_LEGACY",)
+    RETURN_NAMES = ("reference_legacy",)
+    FUNCTION = "build"
+    DESCRIPTION = "💎 Vibe Transfer builder (legacy). Adds a legacy reference image for NovelAI generation. This feature can spend Anlas."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "information_extracted": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "strength": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+            "optional": {
+                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
+            },
+        }
+
+    def build(self, image, enabled=True, information_extracted=0.50, strength=0.60, reference_legacy=None):
+        current: List[Dict[str, Any]] = []
+        if isinstance(reference_legacy, list):
+            current = [dict(x) for x in reference_legacy if isinstance(x, dict)]
+        elif isinstance(reference_legacy, dict):
+            current = [dict(reference_legacy)]
+        if enabled:
+            current.append({
+                "mode": "vibe_transfer",
+                "image": legacy_reference_tensor_to_base64(image),
                 "information_extracted": float(information_extracted),
                 "strength": float(strength),
             })
@@ -1521,11 +1659,12 @@ class NovelAIT2ICompact:
                 "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
+                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, prompt, negative_prompt, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
+    def generate(self, prompt, negative_prompt, parameters=None, retry_settings=None, characters=None, references=None, reference_legacy=None, api_token=""):
         base = merge_parameter_values(parameters)
         retry = merge_retry_values(retry_settings)
         result = generate_novelai(
@@ -1558,6 +1697,7 @@ class NovelAIT2ICompact:
             parameters=parameters,
             characters=characters,
             references=references,
+            reference_legacy=reference_legacy,
         )
         return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
 
@@ -1584,11 +1724,12 @@ class NovelAII2ICompact:
                 "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
+                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt, negative_prompt, strength, noise, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
+    def generate(self, image, prompt, negative_prompt, strength, noise, parameters=None, retry_settings=None, characters=None, references=None, reference_legacy=None, api_token=""):
         base = merge_parameter_values(parameters)
         retry = merge_retry_values(retry_settings)
         result = generate_novelai(
@@ -1624,9 +1765,9 @@ class NovelAII2ICompact:
             parameters=parameters,
             characters=characters,
             references=references,
+            reference_legacy=reference_legacy,
         )
         return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
-
 
 class NovelAIInpaint:
     CATEGORY = "NovelAI"
@@ -2226,6 +2367,7 @@ NODE_CLASS_MAPPINGS = {
     "NovelAIRetrySettings": NovelAIRetrySettings,
     "NovelAICharacter": NovelAICharacter,
     "NovelAIPreciseReference": NovelAIPreciseReference,
+    "NovelAIVibeTransferLegacy": NovelAIVibeTransferLegacy,
     "NovelAICharacterStack": NovelAICharacterStack,
     "NovelAIT2I": NovelAIT2ICompact,
     "NovelAII2I": NovelAII2ICompact,
@@ -2247,6 +2389,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NovelAIRetrySettings": "NovelAI Retry Settings",
     "NovelAICharacter": "NovelAI Character (V4.5)",
     "NovelAIPreciseReference": "NovelAI 💎 Precise Reference (V4.5)",
+    "NovelAIVibeTransferLegacy": "NovelAI 💎 Vibe Transfer (legacy)",
     "NovelAICharacterStack": "NovelAI Character Stack (V4.5)",
     "NovelAIT2I": "NovelAI T2I",
     "NovelAII2I": "NovelAI I2I",
