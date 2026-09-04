@@ -19,7 +19,7 @@ from PIL import Image, ImageOps
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 COMFY_ROOT = os.getcwd()
 GEN_ENDPOINT = "https://image.novelai.net/ai/generate-image"
-USER_DATA_ENDPOINT = "https://api.novelai.net/user/data"
+USER_DATA_ENDPOINT = "https://image.novelai.net/user/data"
 
 # 500 can be persistent when payload is rejected internally, so it retries only max_retries times.
 RETRY_FOREVER_STATUS = {408, 409, 425, 429, 502, 503, 504}
@@ -27,7 +27,14 @@ RETRY_LIMITED_STATUS = {500}
 FATAL_AUTH_STATUS = {401, 403}
 FATAL_ACCOUNT_STATUS = {402}
 
+TOKEN_SOURCE_CHOICES = ["auto", "token.txt", ".env", "node_input"]
+
 MODEL_CHOICES = [
+    # NovelAI Diffusion V5 (released 2026-08-21). Identifiers follow NAI's
+    # established naming convention; if the API rejects one with an
+    # "unrecognized model" error, please report it so it can be corrected.
+    "nai-diffusion-5-full",
+    "nai-diffusion-5-curated",
     "nai-diffusion-4-5-full",
     "nai-diffusion-4-5-curated",
     "nai-diffusion-4-full",
@@ -112,23 +119,6 @@ CHARACTER_GRID_ROW_MAP = {
     "5": 0.90,
 }
 
-PRECISE_REFERENCE_TYPE_CHOICES = [
-    "Character & Style",
-    "Character",
-    "Style",
-]
-
-PRECISE_REFERENCE_TYPE_MAP = {
-    "Character & Style": "character&style",
-    "Character": "character",
-    "Style": "style",
-    "character&style": "character&style",
-    "character": "character",
-    "style": "style",
-}
-
-DEFAULT_PRECISE_REFERENCE_TYPE = "Character & Style"
-
 UC_PRESET_CHOICES = ["0", "1", "2", "3"]
 
 UC_PRESET_TEXT = {
@@ -136,13 +126,6 @@ UC_PRESET_TEXT = {
     "1": "blurry, lowres, error, worst quality, bad quality, jpeg artifacts, very displeasing, logo, dated, signature",
     "2": "",
     "3": "",
-}
-
-DEFAULT_RETRY_VALUES = {
-    "timeout": 180,
-    "retry_delay": 10,
-    "max_retries": 5,
-    "retry_forever": True,
 }
 
 DEFAULT_PARAM_VALUES = {
@@ -165,51 +148,11 @@ DEFAULT_PARAM_VALUES = {
     "batch_size": 1,
     "legacy": False,
     "check_anlas": False,
+    "timeout": 180,
+    "retry_delay": 10,
+    "max_retries": 5,
+    "retry_forever": True,
 }
-
-
-
-
-ANLAS_LAST_BALANCE: Optional[int] = None
-ANLAS_TOTAL_COST: int = 0
-
-def update_anlas_tracker(current: Optional[int], *, previous_hint: Optional[int] = None, source: str = "", note: str = "") -> Tuple[int, int, str]:
-    """Update global Anlas cost tracker. Returns (last_cost, total_cost, status_text)."""
-    global ANLAS_LAST_BALANCE, ANLAS_TOTAL_COST
-    if current is None:
-        last = 0
-        total = int(ANLAS_TOTAL_COST or 0)
-        shown = ANLAS_LAST_BALANCE if ANLAS_LAST_BALANCE is not None else "?"
-        status = f"Anlas: {shown} | Last Cost: {last} | Total Cost: {total}"
-        if note:
-            status += f" | {note}"
-        if source:
-            status += f" | Token Source: {source}"
-        return last, total, status
-
-    current_i = int(current)
-    last = 0
-    baseline = None
-    if previous_hint is not None:
-        baseline = int(previous_hint)
-    elif ANLAS_LAST_BALANCE is not None:
-        baseline = int(ANLAS_LAST_BALANCE)
-
-    if baseline is not None and current_i < baseline:
-        last = baseline - current_i
-        ANLAS_TOTAL_COST += last
-
-    ANLAS_LAST_BALANCE = current_i
-    total = int(ANLAS_TOTAL_COST or 0)
-    status = f"Anlas: {current_i} | Last Cost: {last} | Total Cost: {total}"
-    if note:
-        status += f" | {note}"
-    if source:
-        status += f" | Token Source: {source}"
-    return int(last), total, status
-
-def get_anlas_tracker_total() -> int:
-    return int(ANLAS_TOTAL_COST or 0)
 
 
 class NovelAIError(RuntimeError):
@@ -252,38 +195,73 @@ def _masked_token(token: str) -> str:
     return token[:6] + "..." + token[-4:]
 
 
-def get_token(api_token: str = "") -> Tuple[str, str]:
-    """Token priority: token.txt -> Comfy root .env -> process env -> node field."""
-    token_txt = os.path.join(NODE_DIR, "token.txt")
-    if os.path.exists(token_txt):
-        try:
+def get_token(api_token: str = "", source_choice: str = "auto") -> Tuple[str, str]:
+    """Token priority and source filtering."""
+    if source_choice == "auto":
+        token_txt = os.path.join(NODE_DIR, "token.txt")
+        if os.path.exists(token_txt):
+            try:
+                with open(token_txt, "r", encoding="utf-8") as f:
+                    token = _clean_token(f.read())
+                if token:
+                    return token, "token.txt"
+            except Exception as exc:
+                print(f"[NovelAI] Could not read token.txt: {exc}")
+
+        env_candidates = [
+            os.path.join(COMFY_ROOT, ".env"),
+            os.path.join(os.path.dirname(NODE_DIR), ".env"),
+            os.path.join(NODE_DIR, ".env"),
+        ]
+        for env_path in env_candidates:
+            env = _read_env_file(env_path)
+            for key in ("NAI_ACCESS_TOKEN", "NAI_API_TOKEN", "NOVELAI_API_TOKEN", "NOVELAI_TOKEN"):
+                token = _clean_token(env.get(key, ""))
+                if token:
+                    return token, env_path
+
+        for key in ("NAI_ACCESS_TOKEN", "NAI_API_TOKEN", "NOVELAI_API_TOKEN", "NOVELAI_TOKEN"):
+            token = _clean_token(os.environ.get(key, ""))
+            if token:
+                return token, f"env:{key}"
+
+        token = _clean_token(api_token)
+        if token:
+            return token, "node_input field"
+
+    elif source_choice == "token.txt":
+        token_txt = os.path.join(NODE_DIR, "token.txt")
+        if os.path.exists(token_txt):
             with open(token_txt, "r", encoding="utf-8") as f:
                 token = _clean_token(f.read())
             if token:
                 return token, "token.txt"
-        except Exception as exc:
-            print(f"[NovelAI] Could not read token.txt: {exc}")
+        raise NovelAIAuthError("Opção 'token.txt' selecionada, mas o arquivo está vazio ou não existe em comfyui_novelai.")
 
-    env_candidates = [
-        os.path.join(COMFY_ROOT, ".env"),
-        os.path.join(os.path.dirname(NODE_DIR), ".env"),
-        os.path.join(NODE_DIR, ".env"),
-    ]
-    for env_path in env_candidates:
-        env = _read_env_file(env_path)
+    elif source_choice == ".env":
+        env_candidates = [
+            os.path.join(COMFY_ROOT, ".env"),
+            os.path.join(os.path.dirname(NODE_DIR), ".env"),
+            os.path.join(NODE_DIR, ".env"),
+        ]
+        for env_path in env_candidates:
+            env = _read_env_file(env_path)
+            for key in ("NAI_ACCESS_TOKEN", "NAI_API_TOKEN", "NOVELAI_API_TOKEN", "NOVELAI_TOKEN"):
+                token = _clean_token(env.get(key, ""))
+                if token:
+                    return token, env_path
+        
         for key in ("NAI_ACCESS_TOKEN", "NAI_API_TOKEN", "NOVELAI_API_TOKEN", "NOVELAI_TOKEN"):
-            token = _clean_token(env.get(key, ""))
+            token = _clean_token(os.environ.get(key, ""))
             if token:
-                return token, env_path
+                return token, f"env:{key}"
+        raise NovelAIAuthError("Opção '.env' selecionada, mas nenhuma variável de token foi encontrada nos arquivos .env.")
 
-    for key in ("NAI_ACCESS_TOKEN", "NAI_API_TOKEN", "NOVELAI_API_TOKEN", "NOVELAI_TOKEN"):
-        token = _clean_token(os.environ.get(key, ""))
+    elif source_choice == "node_input":
+        token = _clean_token(api_token)
         if token:
-            return token, f"env:{key}"
-
-    token = _clean_token(api_token)
-    if token:
-        return token, "api_token field"
+            return token, "node_input field"
+        raise NovelAIAuthError("Opção 'node_input' selecionada, mas o campo api_token está vazio.")
 
     raise NovelAIAuthError(
         "NovelAI token not found. Create token.txt in comfyui_novelai, "
@@ -446,57 +424,6 @@ def image_tensor_to_base64_png(image: torch.Tensor, width: int, height: int) -> 
     pil.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
-def pil_to_base64_for_api(img: Image.Image) -> str:
-    """Encode like the web client: PNG for alpha images, JPEG for normal RGB images."""
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-    buf = io.BytesIO()
-    if img.mode == "RGBA":
-        img.save(buf, format="PNG")
-    else:
-        img.save(buf, format="JPEG", quality=95)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def resize_and_pad_precise_reference_image(img: Image.Image) -> Image.Image:
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    target_sizes = [(1024, 1536), (1472, 1472), (1536, 1024)]
-    ow, oh = img.size
-    if ow <= 0 or oh <= 0:
-        raise NovelAIError("Precise Reference image has invalid dimensions.")
-    ratio = ow / oh
-    target_w, target_h = min(target_sizes, key=lambda size: abs((size[0] / size[1]) - ratio))
-    scale = min(target_w / ow, target_h / oh)
-    nw = max(1, int(round(ow * scale)))
-    nh = max(1, int(round(oh * scale)))
-    resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
-    padded = Image.new("RGB", (target_w, target_h), color=(0, 0, 0))
-    padded.paste(resized, ((target_w - nw) // 2, (target_h - nh) // 2))
-    return padded
-
-
-def precise_reference_tensor_to_base64(image: torch.Tensor) -> str:
-    return pil_to_base64_for_api(resize_and_pad_precise_reference_image(tensor_to_pil(image)))
-
-
-def legacy_reference_tensor_to_base64(image: torch.Tensor) -> str:
-    """Encode a Vibe Transfer / legacy reference without Precise Reference padding."""
-    return pil_to_base64_for_api(tensor_to_pil(image))
-
-
-def normalize_precise_reference_type(value: Any = None) -> str:
-    raw = str(value or DEFAULT_PRECISE_REFERENCE_TYPE).strip()
-    if raw in PRECISE_REFERENCE_TYPE_MAP:
-        return PRECISE_REFERENCE_TYPE_MAP[raw]
-    normalized = raw.lower().replace("_", " ").replace("-", " ").strip()
-    if normalized in {"character style", "character and style", "character & style", "character&style"}:
-        return "character&style"
-    if normalized in {"character", "char"}:
-        return "character"
-    if normalized in {"style"}:
-        return "style"
-    return PRECISE_REFERENCE_TYPE_MAP[DEFAULT_PRECISE_REFERENCE_TYPE]
-
 
 def mask_tensor_to_base64_png(mask: torch.Tensor, width: int, height: int, invert: bool = False) -> str:
     pil = tensor_to_pil(mask).convert("L")
@@ -595,55 +522,26 @@ def normalize_character_prompts(character_prompts_json: str = "", character_prom
     for cp in source:
         if cp is None:
             continue
-
-        ai_choice = False
-        grid = None
-        center = None
-        position_mode = "manual"
-
         if isinstance(cp, dict):
             prompt = cp.get("prompt", cp.get("char_caption", "")) or ""
             uc = cp.get("uc", cp.get("negative", "")) or ""
-            position_mode = str(cp.get("position_mode", "") or "").lower()
-            ai_choice = bool(cp.get("ai_choice", False)) or position_mode in {"ai_choice", "ai_choices"}
-            grid = cp.get("grid")
-            if isinstance(cp.get("centers"), list):
-                centers = cp.get("centers") or []
-                center = centers[0] if centers else None
-            if not isinstance(center, dict):
-                center = cp.get("center") if isinstance(cp.get("center"), dict) else None
-            if not isinstance(center, dict):
+            center = cp.get("center") or cp.get("centers", [{}])[0] if isinstance(cp.get("centers"), list) else cp.get("center")
+            if not center:
                 center = {"x": cp.get("x", 0.5), "y": cp.get("y", 0.5)}
+            ai_position = bool(cp.get("ai_position", False))
         else:
             prompt = getattr(cp, "prompt", "") or ""
             uc = getattr(cp, "uc", "") or ""
-            position_mode = str(getattr(cp, "position_mode", "") or "").lower()
-            ai_choice = bool(getattr(cp, "ai_choice", False)) or position_mode in {"ai_choice", "ai_choices"}
-            grid = getattr(cp, "grid", None)
-            center = getattr(cp, "center", None)
-            if not isinstance(center, dict):
-                center = {"x": getattr(cp, "x", 0.5), "y": getattr(cp, "y", 0.5)}
-
+            center = getattr(cp, "center", None) or {"x": getattr(cp, "x", 0.5), "y": getattr(cp, "y", 0.5)}
+            ai_position = bool(getattr(cp, "ai_position", False))
         try:
             x = float(center.get("x", 0.5))
             y = float(center.get("y", 0.5))
         except Exception:
             x, y = 0.5, 0.5
-
-        item = {
-            "prompt": str(prompt),
-            "uc": str(uc),
-            "center": {"x": _clamp01(x), "y": _clamp01(y)},
-        }
-        if ai_choice:
-            item["ai_choice"] = True
-            item["position_mode"] = "ai_choices"
-        elif position_mode:
-            item["position_mode"] = position_mode
-        if grid:
-            item["grid"] = grid
-        result.append(item)
+        result.append({"prompt": str(prompt), "uc": str(uc), "center": {"x": x, "y": y}, "ai_position": ai_position})
     return result
+
 
 def _clamp01(value: Any, default: float = 0.5) -> float:
     try:
@@ -684,7 +582,7 @@ def build_character_prompts_from_slots(extra: Dict[str, Any]) -> List[Dict[str, 
             extra.get(f"character_{i}_x", 0.5),
             extra.get(f"character_{i}_y", 0.5),
         )
-        result.append({"prompt": prompt, "uc": uc, "center": center})
+        result.append({"prompt": prompt, "uc": uc, "center": center, "ai_position": False})
     return result
 
 
@@ -721,6 +619,10 @@ def parameter_node_inputs() -> Dict[str, Any]:
         "batch_size": ("INT", {"default": DEFAULT_PARAM_VALUES["batch_size"], "min": 1, "max": 8}),
         "legacy": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["legacy"]}),
         "check_anlas": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["check_anlas"]}),
+        "timeout": ("INT", {"default": DEFAULT_PARAM_VALUES["timeout"], "min": 10, "max": 600}),
+        "retry_delay": ("INT", {"default": DEFAULT_PARAM_VALUES["retry_delay"], "min": 1, "max": 300}),
+        "max_retries": ("INT", {"default": DEFAULT_PARAM_VALUES["max_retries"], "min": 0, "max": 999}),
+        "retry_forever": ("BOOLEAN", {"default": DEFAULT_PARAM_VALUES["retry_forever"]}),
     }
 
 
@@ -733,22 +635,6 @@ def merge_parameter_values(config: Any, *, width: Optional[int] = None, height: 
     if height is not None:
         merged["height"] = int(height)
     return merged
-
-
-def character_preview_text(characters: List[Dict[str, Any]]) -> str:
-    if not characters:
-        return "Characters: 0"
-    lines = [f"Characters: {len(characters)}"]
-    for idx, cp in enumerate(characters, start=1):
-        if cp.get("ai_choice"):
-            pos = "AI's Choice"
-        else:
-            center = cp.get("center", {})
-            pos = f"({center.get('x', 0.5):.2f},{center.get('y', 0.5):.2f})"
-        lines.append(
-            f"{idx}. {cp.get('prompt', '')[:60]} | neg: {cp.get('uc', '')[:40]} | pos={pos}"
-        )
-    return "\n".join(lines)
 
 
 def normalize_references(references: Any = None) -> List[Dict[str, Any]]:
@@ -769,126 +655,17 @@ def normalize_references(references: Any = None) -> List[Dict[str, Any]]:
             "information_extracted": float(ref.get("information_extracted", 0.5)),
             "strength": float(ref.get("strength", 0.6)),
             "mode": str(ref.get("mode", "precise_reference") or "precise_reference"),
-            "reference_type": normalize_precise_reference_type(
-                ref.get("reference_type", ref.get("base_caption", ref.get("precise_reference_type", DEFAULT_PRECISE_REFERENCE_TYPE)))
-            ),
         })
     return result
 
 
-def normalize_reference_legacy(reference_legacy: Any = None) -> List[Dict[str, Any]]:
-    if not reference_legacy:
-        return []
-    source = reference_legacy
-    if isinstance(source, dict):
-        source = [source]
-    result: List[Dict[str, Any]] = []
-    for ref in source:
-        if not isinstance(ref, dict):
-            continue
-        image_b64 = str(ref.get("image") or ref.get("image_b64") or "").strip()
-        if not image_b64:
-            continue
-        result.append({
-            "image": image_b64,
-            "information_extracted": float(ref.get("information_extracted", 0.5)),
-            "strength": float(ref.get("strength", 0.6)),
-            "mode": str(ref.get("mode", "vibe_transfer") or "vibe_transfer"),
-        })
-    return result
-
-
-def reference_preview_text(references: List[Dict[str, Any]]) -> str:
-    if not references:
-        return "References: 0"
-    lines = [f"References: {len(references)}"]
-    for idx, ref in enumerate(references, start=1):
-        lines.append(
-            f"{idx}. mode={ref.get('mode', 'precise_reference')} | type={ref.get('reference_type', 'character&style')} | info={float(ref.get('information_extracted', 0.5)):.2f} | strength={float(ref.get('strength', 0.6)):.2f}"
-        )
-    return "\n".join(lines)
-
-
-def reference_legacy_preview_text(references: List[Dict[str, Any]]) -> str:
-    if not references:
-        return "Legacy references: 0"
-    lines = [f"Legacy references: {len(references)}"]
-    for idx, ref in enumerate(references, start=1):
-        lines.append(
-            f"{idx}. mode={ref.get('mode', 'vibe_transfer')} | info={float(ref.get('information_extracted', 0.5)):.2f} | strength={float(ref.get('strength', 0.6)):.2f}"
-        )
-    return "\n".join(lines)
-
-
-def _model_is_v45(model: Any) -> bool:
-    return str(model or "").startswith("nai-diffusion-4-5")
-
-
-def apply_references_to_params(params: Dict[str, Any], references: Any = None, model: str = "") -> int:
+def apply_references_to_params(params: Dict[str, Any], references: Any = None) -> int:
     refs = normalize_references(references)
-
-    # Always clear both legacy Vibe fields and V4.5 precise-reference fields first.
-    params["reference_image_multiple"] = []
-    params["reference_information_extracted_multiple"] = []
-    params["reference_strength_multiple"] = []
-    params.pop("director_reference_images", None)
-    params.pop("director_reference_descriptions", None)
-    params.pop("director_reference_strength_values", None)
-    params.pop("director_reference_secondary_strength_values", None)
-    params.pop("director_reference_information_extracted", None)
-
     if not refs:
+        params["reference_image_multiple"] = []
+        params["reference_information_extracted_multiple"] = []
+        params["reference_strength_multiple"] = []
         return 0
-
-    modes = {str(r.get("mode", "precise_reference") or "precise_reference") for r in refs}
-    unsupported = modes - {"precise_reference"}
-    if unsupported:
-        raise NovelAIError(
-            "Unsupported reference mode for the Precise Reference input: "
-            + ", ".join(sorted(unsupported))
-            + ". Use NovelAI Precise Reference with the references input, or use Vibe Transfer (legacy) with reference_legacy."
-        )
-
-    if not _model_is_v45(model):
-        raise NovelAIError(
-            "Precise Reference is V4.5-only in this node pack. "
-            "Use nai-diffusion-4-5-full / nai-diffusion-4-5-curated, or disconnect Precise Reference."
-        )
-
-    params["director_reference_images"] = [r["image"] for r in refs]
-    # API expects V4ConditionInput objects here, not plain strings.
-    # base_caption selects what kind of precise reference is applied.
-    params["director_reference_descriptions"] = [
-        {
-            "caption": {"base_caption": normalize_precise_reference_type(r.get("reference_type")), "char_captions": []},
-            "legacy_uc": False,
-        }
-        for r in refs
-    ]
-    params["director_reference_strength_values"] = [float(r["strength"]) for r in refs]
-    params["director_reference_secondary_strength_values"] = [1.0 - float(r["information_extracted"]) for r in refs]
-    params["director_reference_information_extracted"] = [1.0 for _ in refs]
-    return len(refs)
-
-
-def apply_reference_legacy_to_params(params: Dict[str, Any], reference_legacy: Any = None) -> int:
-    refs = normalize_reference_legacy(reference_legacy)
-    if not refs:
-        return 0
-
-    if params.get("director_reference_images"):
-        raise NovelAIError(
-            "Precise Reference and Vibe Transfer (legacy) cannot be used together. "
-            "Disconnect either references or reference_legacy."
-        )
-
-    # Vibe Transfer uses the legacy reference_* fields and must not include V4.5 director-reference fields.
-    params.pop("director_reference_images", None)
-    params.pop("director_reference_descriptions", None)
-    params.pop("director_reference_strength_values", None)
-    params.pop("director_reference_secondary_strength_values", None)
-    params.pop("director_reference_information_extracted", None)
-
     params["reference_image_multiple"] = [r["image"] for r in refs]
     params["reference_information_extracted_multiple"] = [float(r["information_extracted"]) for r in refs]
     params["reference_strength_multiple"] = [float(r["strength"]) for r in refs]
@@ -899,6 +676,7 @@ def perform_novelai_request(
     *,
     payload: Dict[str, Any],
     api_token: str,
+    token_source: str = "auto",
     timeout: int,
     retry_delay: int,
     max_retries: int,
@@ -906,7 +684,7 @@ def perform_novelai_request(
     check_anlas: bool,
     estimated_cost: int = 0,
 ) -> Tuple[torch.Tensor, str, int, int, int, str]:
-    token, source = get_token(api_token)
+    token, source = get_token(api_token, token_source)
     print(f"[NovelAI] Using token from {source}: {_masked_token(token)}")
 
     before = None
@@ -932,17 +710,14 @@ def perform_novelai_request(
         print(f"[NovelAI] Anlas after: {after if after is not None else msg}")
 
     actual_cost = 0
-    tracker_status = ""
     if before is not None and after is not None:
         actual_cost = max(0, int(before) - int(after))
-        tracked_last, _, tracker_status = update_anlas_tracker(after, previous_hint=before, source=source, note="after generation")
-        actual_cost = tracked_last if tracked_last > 0 else actual_cost
-    else:
-        _, _, tracker_status = update_anlas_tracker(after if after is not None else before, source=source, note="after generation")
     estimated_next_cost = actual_cost if actual_cost > 0 else int(estimated_cost)
     anlas_text = (
-        f"{tracker_status}"
+        f"Anlas: {after if after is not None else (before if before is not None else '?')}"
         f" | Estimated Cost: {estimated_next_cost}"
+        f" | Last Actual Cost: {actual_cost}"
+        f" | Token Source: {source}"
     )
     return image_tensor, anlas_text, int(before or 0), int(after or 0), int(actual_cost), source
 
@@ -976,16 +751,20 @@ def build_parameters(
     api_sampler = "ddim_v3" if sampler == "ddim" else sampler
     char_prompts = normalize_character_prompts(character_prompts_json, character_prompts)
 
-    char_captions = []
-    uc_char_captions = []
-    uses_ai_choices = False
-    for cp in char_prompts:
-        center = cp.get("center") if isinstance(cp.get("center"), dict) else {"x": 0.5, "y": 0.5}
-        safe_center = {"x": _clamp01(center.get("x", 0.5)), "y": _clamp01(center.get("y", 0.5))}
-        if cp.get("prompt"):
-            char_captions.append({"char_caption": cp["prompt"], "centers": [safe_center]})
-        if cp.get("uc"):
-            uc_char_captions.append({"char_caption": cp["uc"], "centers": [safe_center]})
+    use_coords = True
+    if char_prompts and any(cp.get("ai_position", False) for cp in char_prompts):
+        use_coords = False
+
+    char_captions = [
+        {"char_caption": cp["prompt"], "centers": [cp["center"]]}
+        for cp in char_prompts
+        if cp.get("prompt")
+    ]
+    uc_char_captions = [
+        {"char_caption": cp["uc"], "centers": [cp["center"]]}
+        for cp in char_prompts
+        if cp.get("uc")
+    ]
 
     params: Dict[str, Any] = {
         "params_version": 1,
@@ -1022,7 +801,7 @@ def build_parameters(
         "extra_noise_seed": int(seed),
         "characterPrompts": char_prompts,
         "v4_prompt": {
-            "use_coords": True,
+            "use_coords": use_coords,
             "use_order": True,
             "caption": {"base_caption": prompt or "", "char_captions": char_captions},
         },
@@ -1050,11 +829,9 @@ def choose_seed(seed: int, seed_mode: str, counter_name: str) -> int:
 
 
 def estimate_anlas_cost(*, width: int, height: int, steps: int, batch_size: int, img2img: bool, quality_toggle: bool) -> int:
-    """Rough heuristic only. Real cost is measured via before/after balance when check_anlas=True."""
     pixels = int(width) * int(height)
     megapixels = pixels / 1048576.0
     base = 0
-    # Very rough heuristic: common 1MP generations are often free/cheap; bigger jobs tend to cost more.
     if megapixels > 1.05:
         base += int(round((megapixels - 1.0) * 18))
     if int(steps) > 28:
@@ -1090,7 +867,8 @@ def generate_novelai(
     sm_dyn: bool,
     batch_size: int,
     legacy: bool,
-    api_token: str,
+    token_source: str = "auto",
+    api_token: str = "",
     timeout: int,
     retry_delay: int,
     max_retries: int,
@@ -1104,10 +882,9 @@ def generate_novelai(
     parameters: Any = None,
     characters: Any = None,
     references: Any = None,
-    reference_legacy: Any = None,
     **extra: Any,
 ) -> Tuple[torch.Tensor, str, str, int, int, int]:
-    token, source = get_token(api_token)
+    token, source = get_token(api_token, token_source)
     print(f"[NovelAI] Using token from {source}: {_masked_token(token)}")
 
     resolved = merge_parameter_values(parameters)
@@ -1130,6 +907,11 @@ def generate_novelai(
     batch_size = int(resolved["batch_size"])
     legacy = bool(resolved["legacy"])
     check_anlas = bool(resolved["check_anlas"])
+    timeout = int(resolved["timeout"])
+    retry_delay = int(resolved["retry_delay"])
+    max_retries = int(resolved["max_retries"])
+    retry_forever = bool(resolved["retry_forever"])
+    
     if img2img_image is not None and not isinstance(parameters, dict):
         try:
             if img2img_image.ndim == 4:
@@ -1157,6 +939,7 @@ def generate_novelai(
 
     actual_seed = choose_seed(seed, seed_mode, "counter_i2i" if img2img_image is not None else "counter_t2i")
     slot_character_prompts = build_character_prompts_from_slots(extra)
+    
     if characters is not None:
         effective_character_prompts_json = ""
         effective_character_prompts = characters
@@ -1189,8 +972,7 @@ def generate_novelai(
         character_prompts_json=effective_character_prompts_json,
         character_prompts=effective_character_prompts,
     )
-    reference_count = apply_references_to_params(params, references, model=model)
-    reference_legacy_count = apply_reference_legacy_to_params(params, reference_legacy)
+    reference_count = apply_references_to_params(params, references)
 
     action = "generate"
     if img2img_image is not None:
@@ -1229,17 +1011,14 @@ def generate_novelai(
         print(f"[NovelAI] Anlas after: {after if after is not None else msg}")
 
     actual_cost = 0
-    tracker_status = ""
     if before is not None and after is not None:
         actual_cost = max(0, int(before) - int(after))
-        tracked_last, _, tracker_status = update_anlas_tracker(after, previous_hint=before, source=source, note="after generation")
-        actual_cost = tracked_last if tracked_last > 0 else actual_cost
-    else:
-        _, _, tracker_status = update_anlas_tracker(after if after is not None else before, source=source, note="after generation")
     estimated_next_cost = actual_cost if actual_cost > 0 else estimated_cost
     anlas_text = (
-        f"{tracker_status}"
+        f"Anlas: {after if after is not None else (before if before is not None else '?')}"
         f" | Estimated Cost: {estimated_next_cost}"
+        f" | Last Actual Cost: {actual_cost}"
+        f" | Token Source: {source}"
     )
 
     info = {
@@ -1257,7 +1036,6 @@ def generate_novelai(
         "batch_size": int(batch_size),
         "character_count": len(normalize_character_prompts("", effective_character_prompts)) if effective_character_prompts is not None else len(normalize_character_prompts(effective_character_prompts_json, None)),
         "reference_count": int(reference_count),
-        "reference_legacy_count": int(reference_legacy_count),
         "strength": float(strength) if img2img_image is not None else None,
         "noise": float(noise) if img2img_image is not None else None,
         "anlas_before": before,
@@ -1306,6 +1084,7 @@ class NovelAIT2ILegacy:
                 "retry_delay": ("INT", {"default": 10, "min": 1, "max": 300}),
                 "max_retries": ("INT", {"default": 5, "min": 0, "max": 999}),
                 "retry_forever": ("BOOLEAN", {"default": True}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
                 **character_slot_inputs(),
             },
             "optional": {
@@ -1358,6 +1137,7 @@ class NovelAII2ILegacy:
                 "retry_delay": ("INT", {"default": 10, "min": 1, "max": 300}),
                 "max_retries": ("INT", {"default": 5, "min": 0, "max": 999}),
                 "retry_forever": ("BOOLEAN", {"default": True}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
                 **character_slot_inputs(),
             },
             "optional": {
@@ -1405,35 +1185,6 @@ class NovelAIParameters:
     def build(self, **kwargs):
         config = merge_parameter_values(kwargs)
         return (config,)
-
-
-def merge_retry_values(retry_settings: Any = None) -> Dict[str, Any]:
-    merged = dict(DEFAULT_RETRY_VALUES)
-    if isinstance(retry_settings, dict):
-        merged.update({k: v for k, v in retry_settings.items() if k in merged})
-    return merged
-
-
-class NovelAIRetrySettings:
-    CATEGORY = "NovelAI"
-    RETURN_TYPES = ("NAI_RETRY_SETTINGS",)
-    RETURN_NAMES = ("retry_settings",)
-    FUNCTION = "build"
-    DESCRIPTION = "Builds reusable timeout and retry settings for NovelAI T2I/I2I nodes."
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "timeout": ("INT", {"default": DEFAULT_RETRY_VALUES["timeout"], "min": 10, "max": 600}),
-                "retry_delay": ("INT", {"default": DEFAULT_RETRY_VALUES["retry_delay"], "min": 1, "max": 300}),
-                "max_retries": ("INT", {"default": DEFAULT_RETRY_VALUES["max_retries"], "min": 0, "max": 999}),
-                "retry_forever": ("BOOLEAN", {"default": DEFAULT_RETRY_VALUES["retry_forever"]}),
-            }
-        }
-
-    def build(self, **kwargs):
-        return (merge_retry_values(kwargs),)
 
 
 class NovelAICharactersLegacy:
@@ -1499,6 +1250,7 @@ class NovelAICharacter:
                 "uc": negative,
                 "center": center,
                 "grid": {"col": str(position_col), "row": str(position_row)},
+                "ai_position": False
             })
         return (current,)
 
@@ -1516,7 +1268,6 @@ class NovelAIPreciseReference:
             "required": {
                 "image": ("IMAGE",),
                 "enabled": ("BOOLEAN", {"default": True}),
-                "reference_type": (PRECISE_REFERENCE_TYPE_CHOICES, {"default": DEFAULT_PRECISE_REFERENCE_TYPE}),
                 "information_extracted": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "strength": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
@@ -1525,7 +1276,7 @@ class NovelAIPreciseReference:
             },
         }
 
-    def build(self, image, enabled=True, reference_type=DEFAULT_PRECISE_REFERENCE_TYPE, information_extracted=0.50, strength=0.60, references=None):
+    def build(self, image, enabled=True, information_extracted=0.50, strength=0.60, references=None):
         current: List[Dict[str, Any]] = []
         if isinstance(references, list):
             current = [dict(x) for x in references if isinstance(x, dict)]
@@ -1538,20 +1289,19 @@ class NovelAIPreciseReference:
                 h, w = int(image.shape[0]), int(image.shape[1])
             current.append({
                 "mode": "precise_reference",
-                "image": precise_reference_tensor_to_base64(image),
-                "reference_type": normalize_precise_reference_type(reference_type),
+                "image": image_tensor_to_base64_png(image, w, h),
                 "information_extracted": float(information_extracted),
                 "strength": float(strength),
             })
         return (current,)
 
 
-class NovelAIVibeTransferLegacy:
+class NovelAIVibeTransfer:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("NAI_REFERENCE_LEGACY",)
-    RETURN_NAMES = ("reference_legacy",)
+    RETURN_TYPES = ("NAI_REFERENCES",)
+    RETURN_NAMES = ("references",)
     FUNCTION = "build"
-    DESCRIPTION = "💎 Vibe Transfer builder (legacy). Adds a legacy reference image for NovelAI generation. This feature can spend Anlas."
+    DESCRIPTION = "💎 Vibe Transfer builder. Adds a reference image for NovelAI generation. This feature can spend Anlas."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1559,24 +1309,28 @@ class NovelAIVibeTransferLegacy:
             "required": {
                 "image": ("IMAGE",),
                 "enabled": ("BOOLEAN", {"default": True}),
-                "information_extracted": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "strength": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "information_extracted": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "strength": ("FLOAT", {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
+                "references": ("NAI_REFERENCES",),
             },
         }
 
-    def build(self, image, enabled=True, information_extracted=0.50, strength=0.60, reference_legacy=None):
+    def build(self, image, enabled=True, information_extracted=0.40, strength=0.80, references=None):
         current: List[Dict[str, Any]] = []
-        if isinstance(reference_legacy, list):
-            current = [dict(x) for x in reference_legacy if isinstance(x, dict)]
-        elif isinstance(reference_legacy, dict):
-            current = [dict(reference_legacy)]
+        if isinstance(references, list):
+            current = [dict(x) for x in references if isinstance(x, dict)]
+        elif isinstance(references, dict):
+            current = [dict(references)]
         if enabled:
+            if image.ndim == 4:
+                h, w = int(image.shape[1]), int(image.shape[2])
+            else:
+                h, w = int(image.shape[0]), int(image.shape[1])
             current.append({
                 "mode": "vibe_transfer",
-                "image": legacy_reference_tensor_to_base64(image),
+                "image": image_tensor_to_base64_png(image, w, h),
                 "information_extracted": float(information_extracted),
                 "strength": float(strength),
             })
@@ -1588,64 +1342,44 @@ class NovelAICharacterStack:
     RETURN_TYPES = ("NAI_CHARACTERS",)
     RETURN_NAMES = ("characters",)
     FUNCTION = "build"
-    DESCRIPTION = "Combines up to 8 character inputs. Position Mode: position random = NovelAI-like AI Choices; position manual = keep Character grid positions."
+    DESCRIPTION = "Combines up to 22 character inputs into a single characters output. Enables AI Position."
 
     @classmethod
     def INPUT_TYPES(cls):
         optional = {}
-        for i in range(1, 9):
+        for i in range(1, 23):
             optional[f"character_{i}"] = ("NAI_CHARACTERS",)
         return {
             "required": {
-                "position_mode": (["position random", "position manual"], {"default": "position random"}),
-            },
-            "optional": optional,
+                "ai_position": ("BOOLEAN", {"default": False}),
+            }, 
+            "optional": optional
         }
 
-    def build(self, position_mode="position random", **kwargs):
+    def build(self, ai_position=False, **kwargs):
         combined = []
-        for i in range(1, 9):
+        for i in range(1, 23):
             key = f"character_{i}"
             value = kwargs.get(key)
             if isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        combined.append(dict(item))
+                        itm = dict(item)
+                        itm["ai_position"] = ai_position
+                        combined.append(itm)
             elif isinstance(value, dict):
-                combined.append(dict(value))
-
-        normalized = normalize_character_prompts("", combined)
-        mode = str(position_mode or "position random").strip().lower()
-
-        if mode in {"position random", "random", "ai_choices", "ai_choice", "random_grid"}:
-            grid_slots = [(c, r) for r in CHARACTER_GRID_ROWS for c in CHARACTER_GRID_COLS]
-            random.shuffle(grid_slots)
-            converted = []
-            for idx, cp in enumerate(normalized):
-                col, row = grid_slots[idx % len(grid_slots)]
-                item = dict(cp)
-                item.pop("ai_choice", None)
-                item["position_mode"] = "position random"
-                item["grid"] = {"col": col, "row": row}
-                item["center"] = _character_grid_position(col, row)
-                converted.append(item)
-            return (converted,)
-
-        converted = []
-        for cp in normalized:
-            item = dict(cp)
-            item.pop("ai_choice", None)
-            item["position_mode"] = "position manual"
-            converted.append(item)
-        return (converted,)
+                itm = dict(value)
+                itm["ai_position"] = ai_position
+                combined.append(itm)
+        return (combined,)
 
 
 class NovelAIT2ICompact:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("image", "anlas", "last_actual_cost", "actual_cost_total", "status_text")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("image", "info_json", "anlas_text", "anlas_before", "anlas_after", "actual_cost")
     FUNCTION = "generate"
-    DESCRIPTION = "Compact NovelAI text-to-image node that receives parameters, retry settings, characters and references from separate builder nodes."
+    DESCRIPTION = "Compact NovelAI text-to-image node that receives parameters and characters from separate builder nodes."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1653,21 +1387,19 @@ class NovelAIT2ICompact:
             "required": {
                 "prompt": ("STRING", {"multiline": True, "default": "masterpiece, best quality, 1girl"}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "lowres, bad anatomy, bad hands, text, error"}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
-                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, prompt, negative_prompt, parameters=None, retry_settings=None, characters=None, references=None, reference_legacy=None, api_token=""):
+    def generate(self, prompt, negative_prompt, token_source="auto", parameters=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        retry = merge_retry_values(retry_settings)
-        result = generate_novelai(
+        return generate_novelai(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=base["width"],
@@ -1688,26 +1420,25 @@ class NovelAIT2ICompact:
             sm_dyn=base["sm_dyn"],
             batch_size=base["batch_size"],
             legacy=base["legacy"],
+            token_source=token_source,
             api_token=api_token,
-            timeout=retry["timeout"],
-            retry_delay=retry["retry_delay"],
-            max_retries=retry["max_retries"],
-            retry_forever=retry["retry_forever"],
-            check_anlas=True,
+            timeout=base["timeout"],
+            retry_delay=base["retry_delay"],
+            max_retries=base["max_retries"],
+            retry_forever=base["retry_forever"],
+            check_anlas=base["check_anlas"],
             parameters=parameters,
             characters=characters,
             references=references,
-            reference_legacy=reference_legacy,
         )
-        return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
 
 
 class NovelAII2ICompact:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("image", "anlas", "last_actual_cost", "actual_cost_total", "status_text")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("image", "info_json", "anlas_text", "anlas_before", "anlas_after", "actual_cost")
     FUNCTION = "generate"
-    DESCRIPTION = "Compact NovelAI image-to-image node that receives parameters, retry settings, characters and references from separate builder nodes."
+    DESCRIPTION = "Compact NovelAI image-to-image node that receives parameters and characters from separate builder nodes."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1718,21 +1449,19 @@ class NovelAII2ICompact:
                 "negative_prompt": ("STRING", {"multiline": True, "default": "lowres, bad anatomy, bad hands, text, error"}),
                 "strength": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "noise": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
-                "reference_legacy": ("NAI_REFERENCE_LEGACY",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt, negative_prompt, strength, noise, parameters=None, retry_settings=None, characters=None, references=None, reference_legacy=None, api_token=""):
+    def generate(self, image, prompt, negative_prompt, strength, noise, token_source="auto", parameters=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        retry = merge_retry_values(retry_settings)
-        result = generate_novelai(
+        return generate_novelai(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=base["width"],
@@ -1753,11 +1482,12 @@ class NovelAII2ICompact:
             sm_dyn=base["sm_dyn"],
             batch_size=base["batch_size"],
             legacy=base["legacy"],
+            token_source=token_source,
             api_token=api_token,
-            timeout=retry["timeout"],
-            retry_delay=retry["retry_delay"],
-            max_retries=retry["max_retries"],
-            retry_forever=retry["retry_forever"],
+            timeout=base["timeout"],
+            retry_delay=base["retry_delay"],
+            max_retries=base["max_retries"],
+            retry_forever=base["retry_forever"],
             check_anlas=base["check_anlas"],
             img2img_image=image,
             strength=strength,
@@ -1765,9 +1495,8 @@ class NovelAII2ICompact:
             parameters=parameters,
             characters=characters,
             references=references,
-            reference_legacy=reference_legacy,
         )
-        return (result[0], int(result[4]), int(result[5]), get_anlas_tracker_total(), str(result[2]))
+
 
 class NovelAIInpaint:
     CATEGORY = "NovelAI"
@@ -1787,19 +1516,18 @@ class NovelAIInpaint:
                 "invert_mask": ("BOOLEAN", {"default": False}),
                 "strength": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "noise": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, mask, prompt, negative_prompt, invert_mask=False, strength=0.50, noise=0.10, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
+    def generate(self, image, mask, prompt, negative_prompt, invert_mask=False, strength=0.50, noise=0.10, token_source="auto", parameters=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -1833,7 +1561,7 @@ class NovelAIInpaint:
             character_prompts_json="",
             character_prompts=characters,
         )
-        reference_count = apply_references_to_params(params, references, model=str(base["model"]))
+        reference_count = apply_references_to_params(params, references)
         params["image"] = image_tensor_to_base64_png(image, width, height)
         params["mask"] = mask_tensor_to_base64_png(mask, width, height, bool(invert_mask))
         params["strength"] = float(strength)
@@ -1847,11 +1575,12 @@ class NovelAIInpaint:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(retry["timeout"]),
-            retry_delay=int(retry["retry_delay"]),
-            max_retries=int(retry["max_retries"]),
-            retry_forever=bool(retry["retry_forever"]),
-            check_anlas=True,
+            token_source=token_source,
+            timeout=int(base["timeout"]),
+            retry_delay=int(base["retry_delay"]),
+            max_retries=int(base["max_retries"]),
+            retry_forever=bool(base["retry_forever"]),
+            check_anlas=bool(base["check_anlas"]),
             estimated_cost=estimate_anlas_cost(width=width, height=height, steps=int(base["steps"]), batch_size=1, img2img=True, quality_toggle=bool(base["quality_toggle"])) + 1,
         )
         info = {
@@ -1895,19 +1624,18 @@ class NovelAIEnhance:
                 "negative_prompt": ("STRING", {"multiline": True, "default": "lowres, bad anatomy, bad hands, text, error"}),
                 "strength": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "noise": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "characters": ("NAI_CHARACTERS",),
                 "references": ("NAI_REFERENCES",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt, negative_prompt, strength=0.50, noise=0.10, parameters=None, retry_settings=None, characters=None, references=None, api_token=""):
+    def generate(self, image, prompt, negative_prompt, strength=0.50, noise=0.10, token_source="auto", parameters=None, characters=None, references=None, api_token=""):
         base = merge_parameter_values(parameters)
-        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -1941,7 +1669,7 @@ class NovelAIEnhance:
             character_prompts_json="",
             character_prompts=characters,
         )
-        reference_count = apply_references_to_params(params, references, model=str(base["model"]))
+        reference_count = apply_references_to_params(params, references)
         params["image"] = image_tensor_to_base64_png(image, width, height)
         params["strength"] = float(strength)
         params["noise"] = float(noise)
@@ -1954,11 +1682,12 @@ class NovelAIEnhance:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(retry["timeout"]),
-            retry_delay=int(retry["retry_delay"]),
-            max_retries=int(retry["max_retries"]),
-            retry_forever=bool(retry["retry_forever"]),
-            check_anlas=True,
+            token_source=token_source,
+            timeout=int(base["timeout"]),
+            retry_delay=int(base["retry_delay"]),
+            max_retries=int(base["max_retries"]),
+            retry_forever=bool(base["retry_forever"]),
+            check_anlas=bool(base["check_anlas"]),
             estimated_cost=estimate_anlas_cost(width=width, height=height, steps=int(base["steps"]), batch_size=1, img2img=True, quality_toggle=bool(base["quality_toggle"])) + 1,
         )
         info = {
@@ -1999,17 +1728,16 @@ class NovelAIUpscale:
             "required": {
                 "image": ("IMAGE",),
                 "scale_factor": (["2", "4"], {"default": "2"}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, scale_factor="2", parameters=None, retry_settings=None, api_token=""):
+    def generate(self, image, scale_factor="2", token_source="auto", parameters=None, api_token=""):
         base = merge_parameter_values(parameters)
-        retry = merge_retry_values(retry_settings)
         width = int(base["width"])
         height = int(base["height"])
         if image is not None:
@@ -2038,11 +1766,12 @@ class NovelAIUpscale:
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
             api_token=api_token,
-            timeout=int(retry["timeout"]),
-            retry_delay=int(retry["retry_delay"]),
-            max_retries=int(retry["max_retries"]),
-            retry_forever=bool(retry["retry_forever"]),
-            check_anlas=True,
+            token_source=token_source,
+            timeout=int(base["timeout"]),
+            retry_delay=int(base["retry_delay"]),
+            max_retries=int(base["max_retries"]),
+            retry_forever=bool(base["retry_forever"]),
+            check_anlas=bool(base["check_anlas"]),
             estimated_cost=max(1, factor * factor),
         )
         info = {
@@ -2066,8 +1795,8 @@ def run_director_tool(
     *,
     action: str,
     image,
+    token_source: str = "auto",
     parameters: Any = None,
-    retry_settings: Any = None,
     api_token: str = "",
     prompt: str = "",
     negative_prompt: str = "",
@@ -2077,7 +1806,6 @@ def run_director_tool(
     estimated_cost: int = 1,
 ) -> Tuple[torch.Tensor, str, str, int, int, int]:
     base = merge_parameter_values(parameters)
-    retry = merge_retry_values(retry_settings)
     width = int(base["width"])
     height = int(base["height"])
     if image is not None:
@@ -2112,7 +1840,7 @@ def run_director_tool(
         character_prompts_json="",
         character_prompts=characters,
     )
-    reference_count = apply_references_to_params(params, references, model=str(base["model"]))
+    reference_count = apply_references_to_params(params, references)
     params["image"] = image_tensor_to_base64_png(image, width, height)
     if extra_params:
         params.update(extra_params)
@@ -2126,11 +1854,12 @@ def run_director_tool(
     image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
         payload=payload,
         api_token=api_token,
-        timeout=int(retry["timeout"]),
-        retry_delay=int(retry["retry_delay"]),
-        max_retries=int(retry["max_retries"]),
-        retry_forever=bool(retry["retry_forever"]),
-        check_anlas=True,
+        token_source=token_source,
+        timeout=int(base["timeout"]),
+        retry_delay=int(base["retry_delay"]),
+        max_retries=int(base["max_retries"]),
+        retry_forever=bool(base["retry_forever"]),
+        check_anlas=bool(base["check_anlas"]),
         estimated_cost=int(estimated_cost),
     )
     info = {
@@ -2171,20 +1900,20 @@ class NovelAIRemoveBackground:
             "required": {
                 "image": ("IMAGE",),
                 "result_mode": (["generated", "masked", "blend"], {"default": "generated"}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, result_mode="generated", parameters=None, retry_settings=None, api_token=""):
+    def generate(self, image, result_mode="generated", token_source="auto", parameters=None, api_token=""):
         return run_director_tool(
             action="remove_background",
             image=image,
+            token_source=token_source,
             parameters=parameters,
-            retry_settings=retry_settings,
             api_token=api_token,
             extra_params={"result_mode": str(result_mode)},
             estimated_cost=1,
@@ -2201,12 +1930,15 @@ class NovelAILineArt:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "required": {
+                "image": ("IMAGE",),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
+            },
+            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
-        return run_director_tool(action="lineart", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
+    def generate(self, image, token_source="auto", parameters=None, api_token=""):
+        return run_director_tool(action="lineart", image=image, token_source=token_source, parameters=parameters, api_token=api_token, estimated_cost=1)
 
 
 class NovelAISketch:
@@ -2219,12 +1951,15 @@ class NovelAISketch:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "required": {
+                "image": ("IMAGE",),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
+            },
+            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
-        return run_director_tool(action="sketch", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
+    def generate(self, image, token_source="auto", parameters=None, api_token=""):
+        return run_director_tool(action="sketch", image=image, token_source=token_source, parameters=parameters, api_token=api_token, estimated_cost=1)
 
 
 class NovelAIColorize:
@@ -2241,20 +1976,20 @@ class NovelAIColorize:
                 "image": ("IMAGE",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "defry": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 5.0, "step": 0.1}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, prompt="", defry=0.0, parameters=None, retry_settings=None, api_token=""):
+    def generate(self, image, prompt="", defry=0.0, token_source="auto", parameters=None, api_token=""):
         return run_director_tool(
             action="colorize",
             image=image,
+            token_source=token_source,
             parameters=parameters,
-            retry_settings=retry_settings,
             api_token=api_token,
             prompt=prompt,
             extra_params={"defry": float(defry)},
@@ -2282,20 +2017,20 @@ class NovelAIEmotion:
                 "emotion": (EMOTION_CHOICES, {"default": "neutral"}),
                 "emotion_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "parameters": ("NAI_PARAMETERS",),
-                "retry_settings": ("NAI_RETRY_SETTINGS",),
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def generate(self, image, emotion="neutral", emotion_level=0.5, prompt="", parameters=None, retry_settings=None, api_token=""):
+    def generate(self, image, emotion="neutral", emotion_level=0.5, prompt="", token_source="auto", parameters=None, api_token=""):
         return run_director_tool(
             action="emotion",
             image=image,
+            token_source=token_source,
             parameters=parameters,
-            retry_settings=retry_settings,
             api_token=api_token,
             prompt=prompt,
             extra_params={"emotion": str(emotion), "emotion_level": float(emotion_level)},
@@ -2313,20 +2048,23 @@ class NovelAIDeclutter:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {"image": ("IMAGE",)},
-            "optional": {"parameters": ("NAI_PARAMETERS",), "retry_settings": ("NAI_RETRY_SETTINGS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
+            "required": {
+                "image": ("IMAGE",),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
+            },
+            "optional": {"parameters": ("NAI_PARAMETERS",), "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True})},
         }
 
-    def generate(self, image, parameters=None, retry_settings=None, api_token=""):
-        return run_director_tool(action="declutter", image=image, parameters=parameters, retry_settings=retry_settings, api_token=api_token, estimated_cost=1)
+    def generate(self, image, token_source="auto", parameters=None, api_token=""):
+        return run_director_tool(action="declutter", image=image, token_source=token_source, parameters=parameters, api_token=api_token, estimated_cost=1)
 
 
 class NovelAIAnlas:
     CATEGORY = "NovelAI"
-    RETURN_TYPES = ("INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("anlas", "last_actual_cost", "actual_cost_total", "status_text")
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("anlas_text", "anlas")
     FUNCTION = "check"
-    DESCRIPTION = "Checks NovelAI Anlas balance. Remembers the previous balance internally and tracks generation cost automatically."
+    DESCRIPTION = "Checks NovelAI Anlas balance."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2334,40 +2072,33 @@ class NovelAIAnlas:
             "required": {
                 "trigger": ("BOOLEAN", {"default": True}),
                 "timeout": ("INT", {"default": 30, "min": 5, "max": 120}),
+                "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
             "optional": {
                 "api_token": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             },
         }
 
-    def check(self, trigger=True, timeout=30, api_token=""):
+    def check(self, trigger=True, timeout=30, token_source="auto", api_token=""):
         if not trigger:
-            current = int(ANLAS_LAST_BALANCE or 0)
-            total = int(ANLAS_TOTAL_COST or 0)
-            status = f"Anlas: {current if current > 0 else '?'} | Last Cost: 0 | Total Cost: {total} | check disabled"
-            return (current, 0, total, status)
-
-        token, source = get_token(api_token)
+            return ("Anlas check disabled", 0)
+        token, source = get_token(api_token, token_source)
         value, msg = get_anlas_balance(token, timeout=int(timeout))
         if value is None:
-            current = int(ANLAS_LAST_BALANCE or 0)
-            total = int(ANLAS_TOTAL_COST or 0)
-            status = f"Anlas unavailable ({msg}) | Last Cost: 0 | Total Cost: {total}"
-            print(f"[NovelAI] {status}")
-            return (current, 0, total, status)
-
-        last_cost, total, status = update_anlas_tracker(int(value), source=source, note="manual check")
-        print(f"[NovelAI] {status}")
-        return (int(value), int(last_cost), int(total), status)
+            text = f"Anlas unavailable ({msg})"
+            print(f"[NovelAI] {text}")
+            return (text, 0)
+        text = f"Anlas: {value} (token source: {source})"
+        print(f"[NovelAI] {text}")
+        return (text, int(value))
 
 
 NODE_CLASS_MAPPINGS = {
     "NovelAIToken": NovelAIToken,
     "NovelAIParameters": NovelAIParameters,
-    "NovelAIRetrySettings": NovelAIRetrySettings,
     "NovelAICharacter": NovelAICharacter,
     "NovelAIPreciseReference": NovelAIPreciseReference,
-    "NovelAIVibeTransferLegacy": NovelAIVibeTransferLegacy,
+    "NovelAIVibeTransfer": NovelAIVibeTransfer,
     "NovelAICharacterStack": NovelAICharacterStack,
     "NovelAIT2I": NovelAIT2ICompact,
     "NovelAII2I": NovelAII2ICompact,
@@ -2386,21 +2117,20 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NovelAIToken": "NovelAI Token",
     "NovelAIParameters": "NovelAI Parameters",
-    "NovelAIRetrySettings": "NovelAI Retry Settings",
-    "NovelAICharacter": "NovelAI Character (V4.5)",
-    "NovelAIPreciseReference": "NovelAI 💎 Precise Reference (V4.5)",
-    "NovelAIVibeTransferLegacy": "NovelAI 💎 Vibe Transfer (legacy)",
-    "NovelAICharacterStack": "NovelAI Character Stack (V4.5)",
+    "NovelAICharacter": "NovelAI Character",
+    "NovelAIPreciseReference": "NovelAI 💎 Precise Reference",
+    "NovelAIVibeTransfer": "NovelAI 💎 Vibe Transfer",
+    "NovelAICharacterStack": "NovelAI Character Stack",
     "NovelAIT2I": "NovelAI T2I",
     "NovelAII2I": "NovelAI I2I",
     "NovelAIInpaint": "NovelAI 💎 Inpaint",
     "NovelAIEnhance": "NovelAI 💎 Enhance",
     "NovelAIUpscale": "NovelAI 💎 Upscale",
-    "NovelAIRemoveBackground": "NovelAI 💎 Remove Background (Director Tool)",
-    "NovelAILineArt": "NovelAI 💎 Line Art (Director Tool)",
-    "NovelAISketch": "NovelAI 💎 Sketch (Director Tool)",
-    "NovelAIColorize": "NovelAI 💎 Colorize (Director Tool)",
-    "NovelAIEmotion": "NovelAI 💎 Emotion (Director Tool)",
-    "NovelAIDeclutter": "NovelAI 💎 Declutter (Director Tool)",
+    "NovelAIRemoveBackground": "NovelAI 💎 Remove Background",
+    "NovelAILineArt": "NovelAI 💎 Line Art",
+    "NovelAISketch": "NovelAI 💎 Sketch",
+    "NovelAIColorize": "NovelAI 💎 Colorize",
+    "NovelAIEmotion": "NovelAI 💎 Emotion",
+    "NovelAIDeclutter": "NovelAI 💎 Declutter",
     "NovelAIAnlas": "NovelAI Anlas",
 }
