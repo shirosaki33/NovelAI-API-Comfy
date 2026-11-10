@@ -19,7 +19,9 @@ from PIL import Image, ImageOps
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 COMFY_ROOT = os.getcwd()
 GEN_ENDPOINT = "https://image.novelai.net/ai/generate-image"
-USER_DATA_ENDPOINT = "https://image.novelai.net/user/data"
+USER_DATA_ENDPOINT = "https://api.novelai.net/user/data"
+AUGMENT_ENDPOINT = "https://image.novelai.net/ai/augment-image"
+UPSCALE_ENDPOINT = "https://api.novelai.net/ai/upscale"
 
 # 500 can be persistent when payload is rejected internally, so it retries only max_retries times.
 RETRY_FOREVER_STATUS = {408, 409, 425, 429, 502, 503, 504}
@@ -236,7 +238,7 @@ def get_token(api_token: str = "", source_choice: str = "auto") -> Tuple[str, st
                 token = _clean_token(f.read())
             if token:
                 return token, "token.txt"
-        raise NovelAIAuthError("Opção 'token.txt' selecionada, mas o arquivo está vazio ou não existe em comfyui_novelai.")
+        raise NovelAIAuthError("Token source 'token.txt' selected, but the file is empty or missing in the ComfyUI-ShiroTools folder.")
 
     elif source_choice == ".env":
         env_candidates = [
@@ -255,16 +257,16 @@ def get_token(api_token: str = "", source_choice: str = "auto") -> Tuple[str, st
             token = _clean_token(os.environ.get(key, ""))
             if token:
                 return token, f"env:{key}"
-        raise NovelAIAuthError("Opção '.env' selecionada, mas nenhuma variável de token foi encontrada nos arquivos .env.")
+        raise NovelAIAuthError("Token source '.env' selected, but no token variable was found in the .env files.")
 
     elif source_choice == "node_input":
         token = _clean_token(api_token)
         if token:
             return token, "node_input field"
-        raise NovelAIAuthError("Opção 'node_input' selecionada, mas o campo api_token está vazio.")
+        raise NovelAIAuthError("Token source 'node_input' selected, but the api_token input is empty.")
 
     raise NovelAIAuthError(
-        "NovelAI token not found. Create token.txt in comfyui_novelai, "
+        "NovelAI token not found. Create token.txt in the ComfyUI-ShiroTools folder, "
         "or set NAI_ACCESS_TOKEN in ComfyUI/.env, or fill api_token."
     )
 
@@ -294,6 +296,22 @@ def sanitize_payload_for_log(payload: Dict[str, Any]) -> str:
         return json.dumps(dbg, ensure_ascii=False, indent=2)[:5000]
     except Exception as exc:
         return f"<payload log failed: {exc}>"
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep in 1s steps so the ComfyUI Cancel button works during retry waits."""
+    try:
+        import comfy.model_management as _mm
+    except Exception:
+        _mm = None
+    end = time.time() + max(1.0, float(seconds))
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        if _mm is not None:
+            _mm.throw_exception_if_processing_interrupted()
+        time.sleep(min(1.0, remaining))
 
 
 def http_request(
@@ -352,7 +370,7 @@ def request_with_retry(
         except NovelAIError as exc:
             if retry_forever or attempt <= max_retries:
                 print(f"[NovelAI] {exc}. Retry {attempt} in {retry_delay}s...")
-                time.sleep(max(1, int(retry_delay)))
+                _interruptible_sleep(max(1, int(retry_delay)))
                 continue
             raise
 
@@ -376,7 +394,7 @@ def request_with_retry(
         should_retry_limited = status in (RETRY_FOREVER_STATUS | RETRY_LIMITED_STATUS) and attempt <= max_retries
         if should_retry_forever or should_retry_limited:
             print(f"[NovelAI] API {status}. Retry {attempt} in {retry_delay}s. Body: {text[:300]}")
-            time.sleep(max(1, int(retry_delay)))
+            _interruptible_sleep(max(1, int(retry_delay)))
             continue
 
         if status == 500:
@@ -411,6 +429,10 @@ def pil_to_tensor(img: Image.Image) -> torch.Tensor:
 def tensor_to_pil(image: torch.Tensor) -> Image.Image:
     if image.ndim == 4:
         image = image[0]
+    elif image.ndim == 3 and image.shape[-1] not in (1, 3, 4):
+        image = image[0]  # MASK batch (B, H, W)
+    if image.ndim == 3 and image.shape[-1] == 1:
+        image = image[..., 0]
     arr = image.detach().cpu().numpy()
     arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
     return Image.fromarray(arr).convert("RGB")
@@ -525,7 +547,8 @@ def normalize_character_prompts(character_prompts_json: str = "", character_prom
         if isinstance(cp, dict):
             prompt = cp.get("prompt", cp.get("char_caption", "")) or ""
             uc = cp.get("uc", cp.get("negative", "")) or ""
-            center = cp.get("center") or cp.get("centers", [{}])[0] if isinstance(cp.get("centers"), list) else cp.get("center")
+            centers = cp.get("centers")
+            center = cp.get("center") or (centers[0] if isinstance(centers, list) and centers else None)
             if not center:
                 center = {"x": cp.get("x", 0.5), "y": cp.get("y", 0.5)}
             ai_position = bool(cp.get("ai_position", False))
@@ -683,6 +706,7 @@ def perform_novelai_request(
     retry_forever: bool,
     check_anlas: bool,
     estimated_cost: int = 0,
+    endpoint: str = GEN_ENDPOINT,
 ) -> Tuple[torch.Tensor, str, int, int, int, str]:
     token, source = get_token(api_token, token_source)
     print(f"[NovelAI] Using token from {source}: {_masked_token(token)}")
@@ -693,7 +717,7 @@ def perform_novelai_request(
         print(f"[NovelAI] Anlas before: {before if before is not None else msg}")
 
     data = request_with_retry(
-        GEN_ENDPOINT,
+        endpoint,
         payload,
         token,
         timeout=timeout,
@@ -818,6 +842,17 @@ def build_parameters(
     return params
 
 
+def inpaint_model_id(model: str) -> str:
+    """Infill requests need the dedicated '-inpainting' variant of the selected model."""
+    model = str(model)
+    if model.endswith("-inpainting") or "diffusion-2" in model:
+        return model
+    if model == "nai-diffusion-5-curated":
+        # V5 Curated has no inpainting variant yet; NovelAI's own client falls back to V4.5 Curated.
+        return "nai-diffusion-4-5-curated-inpainting"
+    return model + "-inpainting"
+
+
 def choose_seed(seed: int, seed_mode: str, counter_name: str) -> int:
     if seed_mode == "random_each_run":
         return random.randint(0, 9999999999)
@@ -912,7 +947,7 @@ def generate_novelai(
     max_retries = int(resolved["max_retries"])
     retry_forever = bool(resolved["retry_forever"])
     
-    if img2img_image is not None and not isinstance(parameters, dict):
+    if img2img_image is not None:
         try:
             if img2img_image.ndim == 4:
                 h, w = img2img_image.shape[1], img2img_image.shape[2]
@@ -1342,12 +1377,13 @@ class NovelAICharacterStack:
     RETURN_TYPES = ("NAI_CHARACTERS",)
     RETURN_NAMES = ("characters",)
     FUNCTION = "build"
-    DESCRIPTION = "Combines up to 22 character inputs into a single characters output. Enables AI Position."
+    DESCRIPTION = "V5 Character Stack: combines up to 22 character inputs into a single characters output. Enables AI Position."
+    MAX_SLOTS = 22
 
     @classmethod
     def INPUT_TYPES(cls):
         optional = {}
-        for i in range(1, 23):
+        for i in range(1, cls.MAX_SLOTS + 1):
             optional[f"character_{i}"] = ("NAI_CHARACTERS",)
         return {
             "required": {
@@ -1358,7 +1394,7 @@ class NovelAICharacterStack:
 
     def build(self, ai_position=False, **kwargs):
         combined = []
-        for i in range(1, 23):
+        for i in range(1, self.MAX_SLOTS + 1):
             key = f"character_{i}"
             value = kwargs.get(key)
             if isinstance(value, list):
@@ -1372,6 +1408,11 @@ class NovelAICharacterStack:
                 itm["ai_position"] = ai_position
                 combined.append(itm)
         return (combined,)
+
+
+class NovelAICharacterStack6(NovelAICharacterStack):
+    DESCRIPTION = "Character Stack for older models (V4 / V4.5): combines up to 6 character inputs into a single characters output. Enables AI Position."
+    MAX_SLOTS = 6
 
 
 class NovelAIT2ICompact:
@@ -1568,7 +1609,7 @@ class NovelAIInpaint:
         params["noise"] = float(noise)
         payload = {
             "input": prompt or "",
-            "model": str(base["model"]),
+            "model": inpaint_model_id(base["model"]),
             "action": "infill",
             "parameters": params,
         }
@@ -1676,7 +1717,7 @@ class NovelAIEnhance:
         payload = {
             "input": prompt or "",
             "model": str(base["model"]),
-            "action": "enhance",
+            "action": "img2img",
             "parameters": params,
         }
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
@@ -1751,17 +1792,12 @@ class NovelAIUpscale:
         factor = int(scale_factor)
         target_w = width * factor
         target_h = height * factor
-        params = {
-            "width": target_w,
-            "height": target_h,
-            "image": image_tensor_to_base64_png(image, width, height),
-            "scale": factor,
-        }
+        # Dedicated upscaler: width/height are the SOURCE image size, the API applies `scale`.
         payload = {
-            "input": "",
-            "model": str(base["model"]),
-            "action": "upscale",
-            "parameters": params,
+            "image": image_tensor_to_base64_png(image, width, height),
+            "width": width,
+            "height": height,
+            "scale": factor,
         }
         image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
             payload=payload,
@@ -1773,6 +1809,7 @@ class NovelAIUpscale:
             retry_forever=bool(base["retry_forever"]),
             check_anlas=bool(base["check_anlas"]),
             estimated_cost=max(1, factor * factor),
+            endpoint=UPSCALE_ENDPOINT,
         )
         info = {
             "mode": "upscale",
@@ -1805,6 +1842,10 @@ def run_director_tool(
     extra_params: Optional[Dict[str, Any]] = None,
     estimated_cost: int = 1,
 ) -> Tuple[torch.Tensor, str, str, int, int, int]:
+    """Director tools use the dedicated /ai/augment-image endpoint (req_type, not action).
+
+    width/height MUST match the real input image size, otherwise the API answers 500.
+    """
     base = merge_parameter_values(parameters)
     width = int(base["width"])
     height = int(base["height"])
@@ -1817,40 +1858,15 @@ def run_director_tool(
         except Exception:
             pass
 
-    actual_seed = choose_seed(int(base["seed"]), str(base["seed_mode"]), f"counter_{action}")
-    params = build_parameters(
-        prompt=prompt or "",
-        negative_prompt=negative_prompt or "",
-        width=width,
-        height=height,
-        seed=actual_seed,
-        sampler=str(base["sampler"]),
-        scheduler=str(base["scheduler"]),
-        noise_schedule=str(base["noise_schedule"]),
-        steps=int(base["steps"]),
-        cfg_scale=float(base["cfg_scale"]),
-        cfg_rescale=float(base["cfg_rescale"]),
-        uc_preset=str(base["uc_preset"]),
-        quality_toggle=bool(base["quality_toggle"]),
-        prefer_brownian=bool(base["prefer_brownian"]),
-        sm=bool(base["sm"]),
-        sm_dyn=bool(base["sm_dyn"]),
-        batch_size=1,
-        legacy=bool(base["legacy"]),
-        character_prompts_json="",
-        character_prompts=characters,
-    )
-    reference_count = apply_references_to_params(params, references)
-    params["image"] = image_tensor_to_base64_png(image, width, height)
-    if extra_params:
-        params.update(extra_params)
-
-    payload = {
-        "input": prompt or "",
-        "model": str(base["model"]),
-        "action": action,
-        "parameters": params,
+    payload: Dict[str, Any] = {
+        "req_type": action,
+        "width": width,
+        "height": height,
+        "image": image_tensor_to_base64_png(image, width, height),
     }
+    if extra_params:
+        payload.update(extra_params)
+
     image_tensor, anlas_text, before, after, actual_cost, source = perform_novelai_request(
         payload=payload,
         api_token=api_token,
@@ -1861,21 +1877,12 @@ def run_director_tool(
         retry_forever=bool(base["retry_forever"]),
         check_anlas=bool(base["check_anlas"]),
         estimated_cost=int(estimated_cost),
+        endpoint=AUGMENT_ENDPOINT,
     )
     info = {
         "mode": action,
-        "model": str(base["model"]),
-        "seed": actual_seed,
         "width": width,
         "height": height,
-        "sampler": str(base["sampler"]),
-        "scheduler": str(base["scheduler"]),
-        "noise_schedule": str(base["noise_schedule"]),
-        "steps": int(base["steps"]),
-        "cfg_scale": float(base["cfg_scale"]),
-        "cfg_rescale": float(base["cfg_rescale"]),
-        "character_count": len(normalize_character_prompts("", characters)) if characters is not None else 0,
-        "reference_count": int(reference_count),
         "anlas_before": before,
         "anlas_after": after,
         "last_actual_cost": actual_cost,
@@ -1883,7 +1890,7 @@ def run_director_tool(
         "token_source": source,
     }
     if extra_params:
-        info["tool_parameters"] = extra_params
+        info["tool_parameters"] = {k: v for k, v in extra_params.items()}
     return image_tensor, json.dumps(info, ensure_ascii=False, indent=2), anlas_text, before, after, actual_cost
 
 
@@ -1910,12 +1917,11 @@ class NovelAIRemoveBackground:
 
     def generate(self, image, result_mode="generated", token_source="auto", parameters=None, api_token=""):
         return run_director_tool(
-            action="remove_background",
+            action="bg-removal",
             image=image,
             token_source=token_source,
             parameters=parameters,
             api_token=api_token,
-            extra_params={"result_mode": str(result_mode)},
             estimated_cost=1,
         )
 
@@ -1991,8 +1997,7 @@ class NovelAIColorize:
             token_source=token_source,
             parameters=parameters,
             api_token=api_token,
-            prompt=prompt,
-            extra_params={"defry": float(defry)},
+            extra_params={"prompt": str(prompt or ""), "defry": int(round(float(defry)))},
             estimated_cost=1,
         )
 
@@ -2032,8 +2037,11 @@ class NovelAIEmotion:
             token_source=token_source,
             parameters=parameters,
             api_token=api_token,
-            prompt=prompt,
-            extra_params={"emotion": str(emotion), "emotion_level": float(emotion_level)},
+            extra_params={
+                # NovelAI expects "<emotion>;;<extra prompt>" and a defry level (0 = strongest, 5 = weakest).
+                "prompt": f"{str(emotion)};;{str(prompt or '').strip()}",
+                "defry": max(0, min(5, int(round((1.0 - float(emotion_level)) * 5)))),
+            },
             estimated_cost=1,
         )
 
@@ -2100,6 +2108,7 @@ NODE_CLASS_MAPPINGS = {
     "NovelAIPreciseReference": NovelAIPreciseReference,
     "NovelAIVibeTransfer": NovelAIVibeTransfer,
     "NovelAICharacterStack": NovelAICharacterStack,
+    "NovelAICharacterStack6": NovelAICharacterStack6,
     "NovelAIT2I": NovelAIT2ICompact,
     "NovelAII2I": NovelAII2ICompact,
     "NovelAIInpaint": NovelAIInpaint,
@@ -2120,7 +2129,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NovelAICharacter": "NovelAI Character",
     "NovelAIPreciseReference": "NovelAI 💎 Precise Reference",
     "NovelAIVibeTransfer": "NovelAI 💎 Vibe Transfer",
-    "NovelAICharacterStack": "NovelAI Character Stack",
+    "NovelAICharacterStack": "NovelAI Character Stack V5 (22)",
+    "NovelAICharacterStack6": "NovelAI Character Stack V4/V4.5 (6)",
     "NovelAIT2I": "NovelAI T2I",
     "NovelAII2I": "NovelAI I2I",
     "NovelAIInpaint": "NovelAI 💎 Inpaint",
