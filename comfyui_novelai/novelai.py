@@ -2020,10 +2020,11 @@ class NovelAIColorize:
         )
 
 
+# Only identifiers confirmed against external sources, plus the ones already in this node
+# (embarrassed, shy, laughing, determined). Do not add others without a source.
 EMOTION_CHOICES = [
     "neutral", "happy", "sad", "angry", "scared", "surprised", "tired", "excited",
-    "nervous", "thinking", "confused", "shy", "disgusted", "smug", "bored", "laughing",
-    "irritated", "aroused", "embarrassed", "worried", "love", "determined", "hurt", "playful",
+    "confused", "smug", "embarrassed", "shy", "laughing", "determined",
 ]
 
 
