@@ -790,6 +790,12 @@ def build_parameters(
         if cp.get("uc")
     ]
 
+    n_samples = max(1, int(batch_size))
+    limit = max_n_samples(width, height)
+    if n_samples > limit:
+        print(f"[NovelAI] batch_size {n_samples} exceeds the limit of {limit} for {int(width)}x{int(height)}; using {limit}.")
+        n_samples = limit
+
     params: Dict[str, Any] = {
         "params_version": 1,
         "width": int(width),
@@ -800,9 +806,7 @@ def build_parameters(
         "sampler_name": api_sampler,
         "steps": int(steps),
         "seed": int(seed),
-        "n_samples": max(1, int(batch_size)),
-        "batch_size": 1,
-        "n_iter": max(1, int(batch_size)),
+        "n_samples": n_samples,
         "ucPreset": uc_index,
         "qualityToggle": bool(quality_toggle),
         "sm": bool(sm),
@@ -851,6 +855,20 @@ def inpaint_model_id(model: str) -> str:
         # V5 Curated has no inpainting variant yet; NovelAI's own client falls back to V4.5 Curated.
         return "nai-diffusion-4-5-curated-inpainting"
     return model + "-inpainting"
+
+
+def max_n_samples(width: int, height: int) -> int:
+    """Maximum images per request allowed by NovelAI for a given resolution."""
+    pixels = int(width) * int(height)
+    if pixels <= 360448:
+        return 8
+    if pixels <= 409600:
+        return 6
+    if pixels <= 1310720:
+        return 4
+    if pixels <= 1572864:
+        return 2
+    return 1
 
 
 def choose_seed(seed: int, seed_mode: str, counter_name: str) -> int:
@@ -2003,7 +2021,9 @@ class NovelAIColorize:
 
 
 EMOTION_CHOICES = [
-    "neutral", "happy", "sad", "angry", "surprised", "embarrassed", "smug", "shy", "crying", "laughing", "confused", "determined"
+    "neutral", "happy", "sad", "angry", "scared", "surprised", "tired", "excited",
+    "nervous", "thinking", "confused", "shy", "disgusted", "smug", "bored", "laughing",
+    "irritated", "aroused", "embarrassed", "worried", "love", "determined", "hurt", "playful",
 ]
 
 
@@ -2020,7 +2040,7 @@ class NovelAIEmotion:
             "required": {
                 "image": ("IMAGE",),
                 "emotion": (EMOTION_CHOICES, {"default": "neutral"}),
-                "emotion_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "emotion_level": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "1.0 = strongest (NovelAI \"Normal\", defry 0), 0.0 = weakest (defry 5)."}),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "token_source": (TOKEN_SOURCE_CHOICES, {"default": "auto"}),
             },
@@ -2030,7 +2050,7 @@ class NovelAIEmotion:
             },
         }
 
-    def generate(self, image, emotion="neutral", emotion_level=0.5, prompt="", token_source="auto", parameters=None, api_token=""):
+    def generate(self, image, emotion="neutral", emotion_level=1.0, prompt="", token_source="auto", parameters=None, api_token=""):
         return run_director_tool(
             action="emotion",
             image=image,
@@ -2038,8 +2058,8 @@ class NovelAIEmotion:
             parameters=parameters,
             api_token=api_token,
             extra_params={
-                # NovelAI expects "<emotion>;;<extra prompt>" and a defry level (0 = strongest, 5 = weakest).
-                "prompt": f"{str(emotion)};;{str(prompt or '').strip()}",
+                # NovelAI expects "<emotion>;;<extra prompt>;" and a defry level (0 = Normal/strongest ... 5 = Weakest).
+                "prompt": f"{str(emotion).lower()};;{str(prompt or '').strip()};",
                 "defry": max(0, min(5, int(round((1.0 - float(emotion_level)) * 5)))),
             },
             estimated_cost=1,
